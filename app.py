@@ -1,27 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-입고 / 불량 데이터 대시보드
---------------------------------
-주요 개선사항
-1. 공장 / 불량타입 / 데이터 종류를 드롭다운(multiselect)에서 선택
-   - 최초 실행 시 전체 항목 선택
-   - 체크 해제로 원하는 항목만 남길 수 있음
-2. 불량타입 필터는 '불량' 데이터에만 적용
-   - 입고 데이터가 '기타'로 분류되어 입고 수량이 사라지는 기존 문제 방지
-3. 월별 입고/불량 수량과 '월별 입고 대비 불량률'을 함께 표시
-4. 누계 수량은 서로 다른 축을 겹쳐 그리지 않고,
-   - 누계 입고 수량
-   - 누계 불량 수량
-   - 누계 불량률
-   을 별도로 시각화
-5. 불량타입 월별 그래프는 스택형이 아닌 그룹형 막대그래프
-   - 테 / 렌즈를 메인으로 크게 표시
-   - 전체 / 기타는 별도 '군소 타입' 탭에서 표시
-6. SKU별 입고 대비 불량률 TOP 표 제공
-   - 상품코드 기준으로 입고량과 불량량을 매칭
-   - 최소 입고량 조건을 두어 입고 1~2개인 SKU가 100%로 상위에 뜨는 문제 완화
-7. 원본 데이터 검증 정보 제공
-   - 행 수, 수량 합계, 음수 수량, SKU 매칭 현황 등
+입고 / 불량 / 기초재고 대시보드
+================================
+핵심 기준
+1) 2026-01-01 기초재고를 출발점으로 사용한다.
+2) 재고 흐름 = 기초재고 + 누적 입고 - 누적 불량
+3) 불량률의 기본 분모는 '입고만'이 아니라 '당월 가용재고'이다.
+   - 당월 가용재고 = 월초 이론재고 + 당월 입고
+   - 누계 불량률 = 누적 불량 / (기초재고 + 누적 입고)
+4) SKU별 위험도도 기초재고 + 누적 입고를 분모로 계산한다.
+5) 불량 > 입고인 현상은 기초재고가 있으면 정상적으로 발생할 수 있으므로
+   '입고량보다 불량이 많다 = 오류'로 판정하지 않는다.
+6) 다만 기초재고 + 누적 입고 - 누적 불량이 음수가 되는 SKU는
+   '재고흐름 점검' 대상으로 별도 표시한다.
+   (판매/출고/이동 등 이 파일에 없는 재고 감소 거래가 있으면 음수가
+    생길 수 있으므로 자동으로 원본 오류라고 단정하지 않는다.)
+7) 필터는 Excel 필터처럼 multiselect 체크 목록으로 제공하며
+   최초에는 전체 선택 상태이다.
+8) Plotly 색상/템플릿은 Streamlit의 현재 테마를 감지하여
+   라이트/다크 모드에 맞게 자동 변경한다.
 """
 
 import io
@@ -33,11 +30,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 
-# ------------------------------------------------------------------
-# 기본 설정
-# ------------------------------------------------------------------
 st.set_page_config(
-    page_title="입고 / 불량 데이터 대시보드",
+    page_title="입고 / 불량 / 기초재고 대시보드",
     page_icon="📦",
     layout="wide",
 )
@@ -46,124 +40,203 @@ DEFAULT_DATA_PATH = os.path.join(
     os.path.dirname(__file__), "data", "raw_data.xlsx"
 )
 
-FACTORY_COLORS = {
-    "C5공장": "#1f77b4",
-    "C2공장": "#2ca02c",
-    "C2-S공장": "#ff7f0e",
-    "미상": "#7f7f7f",
+FACTORY_COLORS_LIGHT = {
+    "C5공장": "#1565C0",
+    "C2공장": "#2E7D32",
+    "C2-S공장": "#EF6C00",
+    "미상": "#757575",
 }
-
-DEFECT_TYPE_COLORS = {
-    "테": "#d62728",
-    "렌즈": "#9467bd",
-    "전체": "#8c564b",
-    "기타": "#7f7f7f",
+DEFECT_TYPE_COLORS_LIGHT = {
+    "테": "#D32F2F",
+    "렌즈": "#7B1FA2",
+    "전체": "#6D4C41",
+    "기타": "#616161",
+}
+FACTORY_COLORS_DARK = {
+    "C5공장": "#64B5F6",
+    "C2공장": "#81C784",
+    "C2-S공장": "#FFB74D",
+    "미상": "#BDBDBD",
+}
+DEFECT_TYPE_COLORS_DARK = {
+    "테": "#EF5350",
+    "렌즈": "#CE93D8",
+    "전체": "#BCAAA4",
+    "기타": "#B0BEC5",
 }
 
 DEFECT_TYPES_ORDER = ["테", "렌즈", "전체", "기타"]
 DATA_TYPES_ORDER = ["입고", "불량"]
+REQUIRED_TRANSACTION_COLUMNS = [
+    "작업일", "수량", "공급처 상품명", "상품코드", "상품명", "전표제목"
+]
+REQUIRED_BASE_COLUMNS = ["기준일", "상품코드", "상품명", "현재고수량"]
 
 
-# ------------------------------------------------------------------
-# 분류 함수
-# ------------------------------------------------------------------
+def get_theme_type() -> str:
+    """Streamlit 현재 테마를 최대한 안전하게 감지한다."""
+    try:
+        theme = getattr(st.context, "theme", None)
+        theme_type = getattr(theme, "type", None)
+        if theme_type in ("dark", "light"):
+            return theme_type
+    except Exception:
+        pass
+
+    try:
+        base = st.get_option("theme.base")
+        if base in ("dark", "light"):
+            return base
+    except Exception:
+        pass
+
+    # 테마 정보를 읽지 못하면 기본값은 light.
+    return "light"
+
+
+def chart_colors():
+    if get_theme_type() == "dark":
+        return FACTORY_COLORS_DARK, DEFECT_TYPE_COLORS_DARK
+    return FACTORY_COLORS_LIGHT, DEFECT_TYPE_COLORS_LIGHT
+
+
+def apply_theme(fig: go.Figure, height: int = 480):
+    """Plotly를 Streamlit 라이트/다크 모드에 맞춘다."""
+    dark = get_theme_type() == "dark"
+    template = "plotly_dark" if dark else "plotly_white"
+    grid_color = "rgba(255,255,255,0.15)" if dark else "rgba(0,0,0,0.10)"
+    zero_color = "rgba(255,255,255,0.35)" if dark else "rgba(0,0,0,0.25)"
+
+    fig.update_layout(
+        template=template,
+        height=height,
+        margin=dict(t=55, l=20, r=75, b=35),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+        ),
+        font=dict(size=13),
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor=grid_color,
+            zeroline=True,
+            zerolinecolor=zero_color,
+        ),
+    )
+    return fig
+
+
 def classify_factory(value) -> str:
-    """공급처 상품명에서 공장을 분류한다."""
     if pd.isna(value) or str(value).strip() == "":
         return "미상"
 
     text = str(value).upper()
-
-    # C2-S는 C2 문자열도 포함하므로 반드시 먼저 검사
     if "C2-S" in text:
         return "C2-S공장"
     if "C2" in text:
         return "C2공장"
     if "C5" in text:
         return "C5공장"
-
     return "미상"
 
 
 def classify_defect_type(value) -> str:
-    """
-    전표제목 기준 불량타입 분류.
-
-    중요:
-    입고 행도 전표제목이 존재하므로,
-    입고 행에는 이 분류를 필터 조건으로 적용하지 않는다.
-    """
     if pd.isna(value) or str(value).strip() == "":
         return "기타"
 
     text = str(value)
-
     if "전체" in text:
         return "전체"
     if "테" in text:
         return "테"
     if "렌즈" in text:
         return "렌즈"
-
     return "기타"
 
 
-# ------------------------------------------------------------------
-# 데이터 로드
-# ------------------------------------------------------------------
-REQUIRED_COLUMNS = [
-    "작업일",
-    "수량",
-    "공급처 상품명",
-    "상품코드",
-    "상품명",
-    "전표제목",
-]
-
-
-@st.cache_data(show_spinner="엑셀 데이터를 불러오는 중입니다...")
-def load_and_process(file_source) -> Tuple[pd.DataFrame, dict]:
-    """불량/입고 시트를 읽고 공통 데이터프레임으로 만든다."""
-
+@st.cache_data(show_spinner="엑셀 데이터를 불러오고 검증하는 중입니다...")
+def load_and_process(file_source) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
     frames = []
     validation = {
-        "dropped_invalid_dates": 0,
         "source_rows": {},
         "source_qty": {},
         "negative_qty_rows": {},
+        "invalid_dates": {},
+        "base_rows": 0,
+        "base_qty": 0,
+        "base_date_values": [],
     }
 
     for sheet_name, data_kind in [("불량", "불량"), ("입고", "입고")]:
         df = pd.read_excel(file_source, sheet_name=sheet_name)
 
-        validation["source_rows"][data_kind] = len(df)
-        validation["source_qty"][data_kind] = pd.to_numeric(
-            df["수량"], errors="coerce"
-        ).fillna(0).sum()
-
-        validation["negative_qty_rows"][data_kind] = int(
-            (pd.to_numeric(df["수량"], errors="coerce").fillna(0) < 0).sum()
-        )
-
-        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        missing = [c for c in REQUIRED_TRANSACTION_COLUMNS if c not in df.columns]
         if missing:
             raise ValueError(
                 f"'{sheet_name}' 시트에 필수 컬럼이 없습니다: {missing}"
             )
 
+        qty = pd.to_numeric(df["수량"], errors="coerce").fillna(0)
+        work_date = pd.to_datetime(df["작업일"], errors="coerce")
+
+        validation["source_rows"][data_kind] = len(df)
+        validation["source_qty"][data_kind] = float(qty.sum())
+        validation["negative_qty_rows"][data_kind] = int((qty < 0).sum())
+        validation["invalid_dates"][data_kind] = int(work_date.isna().sum())
+
         df["출입구분"] = data_kind
+        df["수량"] = qty
+        df["작업일"] = work_date
         frames.append(df)
 
+    try:
+        base = pd.read_excel(file_source, sheet_name="기초재고")
+    except Exception as e:
+        raise ValueError(
+            "이번 버전은 반드시 '기초재고' 시트가 필요합니다. "
+            f"기초재고 시트를 읽을 수 없습니다: {e}"
+        )
+
+    missing_base = [c for c in REQUIRED_BASE_COLUMNS if c not in base.columns]
+    if missing_base:
+        raise ValueError(
+            f"'기초재고' 시트에 필수 컬럼이 없습니다: {missing_base}"
+        )
+
+    base["기준일"] = pd.to_datetime(base["기준일"], errors="coerce")
+    base["상품코드"] = base["상품코드"].fillna("").astype(str).str.strip()
+    base["상품명"] = base["상품명"].fillna("").astype(str).str.strip()
+    base["현재고수량"] = pd.to_numeric(
+        base["현재고수량"], errors="coerce"
+    ).fillna(0)
+
+    base = base.dropna(subset=["기준일"]).copy()
+
+    validation["base_rows"] = len(base)
+    validation["base_qty"] = float(base["현재고수량"].sum())
+    validation["base_date_values"] = sorted(
+        base["기준일"].dt.strftime("%Y-%m-%d").unique().tolist()
+    )
+    validation["base_negative_rows"] = int(
+        (base["현재고수량"] < 0).sum()
+    )
+
+    # 기초재고 상품코드 중복 검증
+    validation["base_duplicate_skus"] = int(
+        base["상품코드"].duplicated(keep=False).sum()
+    )
+
     df = pd.concat(frames, ignore_index=True, sort=False)
-
-    before = len(df)
-    df["작업일"] = pd.to_datetime(df["작업일"], errors="coerce")
     df = df.dropna(subset=["작업일"]).copy()
-    validation["dropped_invalid_dates"] = before - len(df)
-
     df["년월"] = df["작업일"].dt.to_period("M").astype(str)
-
-    df["수량"] = pd.to_numeric(df["수량"], errors="coerce").fillna(0)
 
     for col in ["상품명", "상품코드", "공급처", "공급처 상품명", "전표제목"]:
         if col in df.columns:
@@ -172,15 +245,13 @@ def load_and_process(file_source) -> Tuple[pd.DataFrame, dict]:
     df["공장"] = df["공급처 상품명"].apply(classify_factory)
     df["불량타입"] = df["전표제목"].apply(classify_defect_type)
 
-    return df, validation
+    return df, base, validation
 
 
-# ------------------------------------------------------------------
-# 공통 함수
-# ------------------------------------------------------------------
-def safe_rate(numerator: float, denominator: float) -> float:
-    """분모가 0이면 0을 반환."""
-    return (numerator / denominator * 100.0) if denominator else 0.0
+def safe_rate(numerator: float, denominator: float):
+    if denominator == 0:
+        return 0.0
+    return numerator / denominator * 100.0
 
 
 def filter_data(
@@ -193,28 +264,20 @@ def filter_data(
     product_name_query: str,
     product_code_query: str,
 ) -> pd.DataFrame:
-    """
-    필터 적용.
-
-    핵심:
-    - 공장 / 데이터 종류는 모든 행에 적용
-    - 불량타입은 불량 행에만 적용
-    - 따라서 '테'만 선택해도 입고 데이터가 사라지지 않는다.
-    """
-
     mask = (
         df["공장"].isin(selected_factories)
         & df["출입구분"].isin(selected_kinds)
         & (df["작업일"].dt.date >= start_date)
         & (df["작업일"].dt.date <= end_date)
     )
-
     result = df.loc[mask].copy()
 
+    # 핵심: 불량타입 필터는 불량 행에만 적용.
     if not result.empty:
         defect_mask = result["출입구분"].eq("불량")
         result = result[
-            (~defect_mask) | result["불량타입"].isin(selected_defect_types)
+            (~defect_mask)
+            | result["불량타입"].isin(selected_defect_types)
         ].copy()
 
     if product_name_query:
@@ -234,12 +297,46 @@ def filter_data(
     return result
 
 
-def monthly_summary(filtered: pd.DataFrame) -> pd.DataFrame:
-    """월별 입고/불량 수량 및 불량률."""
+def filtered_base_stock(
+    base: pd.DataFrame,
+    filtered_transactions: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    기초재고에는 공장/불량타입 정보가 없으므로,
+    선택된 거래 데이터에 등장하는 SKU만 기초재고를 연결한다.
+    상품코드가 선택 조건에 맞는 SKU의 기초재고를 사용한다.
+    """
+    if filtered_transactions.empty:
+        return base.iloc[0:0].copy()
+
+    sku_set = set(filtered_transactions["상품코드"].astype(str))
+    return base[base["상품코드"].isin(sku_set)].copy()
+
+
+def monthly_inventory_summary(
+    filtered: pd.DataFrame,
+    base: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    월별 재고 흐름:
+    월초 이론재고
+    + 당월 입고
+    = 당월 가용재고
+    - 당월 불량
+    = 월말 이론재고
+    """
     if filtered.empty:
         return pd.DataFrame(
-            columns=["년월", "입고", "불량", "불량률"]
+            columns=[
+                "년월", "기초재고", "입고", "불량",
+                "월초이론재고", "당월가용재고", "월말이론재고",
+                "월불량률", "순수입고대비불량률",
+                "누적입고", "누적불량", "누계불량률",
+            ]
         )
+
+    base_sub = filtered_base_stock(base, filtered)
+    base_qty = float(base_sub["현재고수량"].sum())
 
     monthly = (
         filtered.groupby(["년월", "출입구분"])["수량"]
@@ -250,43 +347,64 @@ def monthly_summary(filtered: pd.DataFrame) -> pd.DataFrame:
 
     for col in DATA_TYPES_ORDER:
         if col not in monthly.columns:
-            monthly[col] = 0
+            monthly[col] = 0.0
 
     monthly = monthly[DATA_TYPES_ORDER].copy()
-    monthly["불량률"] = (
-        monthly["불량"].div(monthly["입고"].replace(0, pd.NA)) * 100
+    monthly["입고"] = pd.to_numeric(monthly["입고"], errors="coerce").fillna(0)
+    monthly["불량"] = pd.to_numeric(monthly["불량"], errors="coerce").fillna(0)
+
+    monthly["기초재고"] = base_qty
+    monthly["누적입고"] = monthly["입고"].cumsum()
+    monthly["누적불량"] = monthly["불량"].cumsum()
+
+    monthly["월초이론재고"] = (
+        base_qty
+        + monthly["누적입고"].shift(1, fill_value=0)
+        - monthly["누적불량"].shift(1, fill_value=0)
+    )
+    monthly["당월가용재고"] = monthly["월초이론재고"] + monthly["입고"]
+    monthly["월말이론재고"] = (
+        monthly["당월가용재고"] - monthly["불량"]
+    )
+
+    # 기본 불량률: 기초재고까지 포함한 가용재고 기준
+    monthly["월불량률"] = (
+        monthly["불량"]
+        .div(monthly["당월가용재고"].replace(0, pd.NA))
+        * 100
+    ).fillna(0)
+
+    # 참고용: 순수하게 해당 기간 입고량만 분모로 한 기존 방식
+    monthly["순수입고대비불량률"] = (
+        monthly["불량"]
+        .div(monthly["입고"].replace(0, pd.NA))
+        * 100
+    ).fillna(0)
+
+    # 누계 불량률 역시 기초재고를 포함
+    누계가용 = base_qty + monthly["누적입고"]
+    monthly["누계불량률"] = (
+        monthly["누적불량"]
+        .div(누계가용.replace(0, pd.NA))
+        * 100
     ).fillna(0)
 
     monthly.index.name = "년월"
     return monthly.reset_index()
 
 
-def cumulative_summary(monthly: pd.DataFrame) -> pd.DataFrame:
-    """월별 누계 및 누계 불량률."""
-    result = monthly.copy()
-
-    result["입고누계"] = result["입고"].cumsum()
-    result["불량누계"] = result["불량"].cumsum()
-    result["누계불량률"] = (
-        result["불량누계"].div(result["입고누계"].replace(0, pd.NA)) * 100
-    ).fillna(0)
-
-    return result
-
-
-def sku_defect_rate_table(
+def sku_risk_table(
     filtered: pd.DataFrame,
-    min_inbound_qty: int,
+    base: pd.DataFrame,
+    min_available_qty: int,
     top_n: int,
 ) -> pd.DataFrame:
     """
-    상품코드(SKU) 기준 입고 대비 불량률.
-
-    분모: 선택된 조건의 입고 수량
-    분자: 선택된 조건의 불량 수량
-    비율: 불량 / 입고 * 100
+    SKU 위험도:
+    가용량 = 기초재고 + 누적 입고
+    불량률 = 누적 불량 / 가용량
+    월말이론재고 = 가용량 - 누적 불량
     """
-
     if filtered.empty:
         return pd.DataFrame()
 
@@ -301,130 +419,191 @@ def sku_defect_rate_table(
             공장=("공장", lambda x: ", ".join(sorted(set(x)))),
         )
     )
-
     defect_group = (
         defect.groupby("상품코드", as_index=False)
         .agg(불량수량=("수량", "sum"))
     )
 
-    if inbound_group.empty:
-        return pd.DataFrame()
-
-    result = inbound_group.merge(
-        defect_group,
-        on="상품코드",
-        how="left",
+    base_group = (
+        base.groupby("상품코드", as_index=False)
+        .agg(기초재고=("현재고수량", "sum"))
     )
 
+    # 입고만 존재하는 SKU뿐 아니라 불량만 있는 SKU도 잡기 위해
+    # 거래 전체 SKU를 기준으로 만든다.
+    all_skus = pd.DataFrame(
+        {"상품코드": sorted(set(filtered["상품코드"].astype(str)))}
+    )
+
+    result = all_skus.merge(base_group, on="상품코드", how="left")
+    result = result.merge(inbound_group, on="상품코드", how="left")
+    result = result.merge(defect_group, on="상품코드", how="left")
+
+    result["기초재고"] = result["기초재고"].fillna(0)
+    result["입고수량"] = result["입고수량"].fillna(0)
     result["불량수량"] = result["불량수량"].fillna(0)
+    result["상품명"] = result["상품명"].fillna("")
+    result["공장"] = result["공장"].fillna("기초재고만/거래공장 미상")
 
-    result = result[result["입고수량"] >= min_inbound_qty].copy()
+    result["가용량"] = result["기초재고"] + result["입고수량"]
+    result["월말이론재고"] = result["가용량"] - result["불량수량"]
 
+    result = result[result["가용량"] >= min_available_qty].copy()
     if result.empty:
         return result
 
     result["불량률"] = (
-        result["불량수량"] / result["입고수량"] * 100
+        result["불량수량"]
+        .div(result["가용량"].replace(0, pd.NA))
+        * 100
+    ).fillna(0)
+
+    result["재고흐름"] = result["월말이론재고"].apply(
+        lambda x: "점검필요(음수)" if x < 0 else "정상범위"
     )
 
     result = result.sort_values(
-        ["불량률", "불량수량", "입고수량"],
-        ascending=[False, False, False],
+        ["재고흐름", "불량률", "불량수량", "가용량"],
+        ascending=[True, False, False, False],
+        key=lambda s: (
+            s if s.name != "재고흐름"
+            else s.map({"점검필요(음수)": 0, "정상범위": 1})
+        ),
     ).head(top_n)
 
     result["순위"] = range(1, len(result) + 1)
-    result["불량률"] = result["불량률"].round(2)
 
     return result[
         [
-            "순위",
-            "상품코드",
-            "상품명",
-            "공장",
-            "입고수량",
-            "불량수량",
-            "불량률",
+            "순위", "상품코드", "상품명", "공장",
+            "기초재고", "입고수량", "가용량",
+            "불량수량", "불량률", "월말이론재고", "재고흐름",
         ]
-    ]
+    ].reset_index(drop=True)
+
+
+def stock_flow_validation(
+    filtered: pd.DataFrame,
+    base: pd.DataFrame,
+) -> pd.DataFrame:
+    """SKU별 기초 + 입고 - 불량 흐름을 검증한다."""
+    if filtered.empty:
+        return pd.DataFrame()
+
+    tx = filtered.copy()
+    base_sub = filtered_base_stock(base, tx)
+
+    base_group = (
+        base_sub.groupby("상품코드", as_index=False)
+        .agg(기초재고=("현재고수량", "sum"))
+    )
+    in_group = (
+        tx[tx["출입구분"] == "입고"]
+        .groupby("상품코드", as_index=False)
+        .agg(입고수량=("수량", "sum"))
+    )
+    def_group = (
+        tx[tx["출입구분"] == "불량"]
+        .groupby("상품코드", as_index=False)
+        .agg(불량수량=("수량", "sum"))
+    )
+
+    sku = pd.DataFrame(
+        {"상품코드": sorted(set(tx["상품코드"].astype(str)))}
+    )
+    sku = sku.merge(base_group, on="상품코드", how="left")
+    sku = sku.merge(in_group, on="상품코드", how="left")
+    sku = sku.merge(def_group, on="상품코드", how="left")
+
+    for c in ["기초재고", "입고수량", "불량수량"]:
+        sku[c] = sku[c].fillna(0)
+
+    sku["가용량"] = sku["기초재고"] + sku["입고수량"]
+    sku["이론재고"] = sku["가용량"] - sku["불량수량"]
+    sku["상태"] = sku["이론재고"].apply(
+        lambda x: "점검필요" if x < 0 else "정상"
+    )
+    return sku.sort_values(
+        ["상태", "이론재고"],
+        ascending=[True, True],
+        key=lambda s: (
+            s if s.name != "상태"
+            else s.map({"점검필요": 0, "정상": 1})
+        ),
+    ).reset_index(drop=True)
 
 
 # ------------------------------------------------------------------
-# 화면
+# 화면 시작
 # ------------------------------------------------------------------
-st.title("📦 입고 / 불량 데이터 대시보드")
+st.title("📦 입고 / 불량 / 기초재고 대시보드")
 st.caption(
-    "입고 대비 불량률을 중심으로 월별 추이, 불량타입, 공장, SKU 위험도를 확인합니다."
+    "2026-01-01 기초재고를 출발점으로 입고·불량 재고 흐름과 "
+    "불량률을 계산합니다."
 )
 
-
-# ------------------------------------------------------------------
-# 데이터 입력
-# ------------------------------------------------------------------
 data_source = None
-
 if os.path.exists(DEFAULT_DATA_PATH):
     data_source = DEFAULT_DATA_PATH
 
 uploaded = st.file_uploader(
     "raw_data.xlsx 업로드 (선택)",
     type=["xlsx"],
-    help="기본 경로의 raw_data.xlsx가 있으면 자동으로 사용되며, 업로드한 파일이 있으면 업로드 파일을 사용합니다.",
+    help="업로드하면 업로드한 파일을 사용합니다.",
 )
-
 if uploaded is not None:
     data_source = io.BytesIO(uploaded.getvalue())
 
 if data_source is None:
-    st.info(
-        "data/raw_data.xlsx 파일을 넣거나 위에서 raw_data.xlsx를 업로드해주세요."
-    )
+    st.info("data/raw_data.xlsx를 넣거나 위에서 엑셀 파일을 업로드해주세요.")
     st.stop()
 
 try:
-    df, validation = load_and_process(data_source)
+    df, base, validation = load_and_process(data_source)
 except Exception as e:
     st.error(f"데이터를 읽는 중 오류가 발생했습니다: {e}")
     st.stop()
 
 
 # ------------------------------------------------------------------
-# 데이터 검증 정보
+# 검증
 # ------------------------------------------------------------------
-with st.expander("🔎 원본 데이터 검증 결과", expanded=False):
-    v1, v2, v3, v4 = st.columns(4)
+with st.expander("🔎 원본 데이터 / 기초재고 검증", expanded=True):
+    a, b, c, d, e = st.columns(5)
+    a.metric("기초재고", f"{validation['base_qty']:,.0f}")
+    b.metric("총 입고", f"{validation['source_qty']['입고']:,.0f}")
+    c.metric("총 불량", f"{validation['source_qty']['불량']:,.0f}")
+    d.metric("기초재고 SKU", f"{base['상품코드'].nunique():,}")
+    e.metric("기초재고 기준일", ", ".join(validation["base_date_values"]))
 
-    v1.metric(
-        "불량 원본 행",
-        f"{validation['source_rows'].get('불량', 0):,}",
+    st.write(
+        "원본 행 수:",
+        {
+            "입고": validation["source_rows"]["입고"],
+            "불량": validation["source_rows"]["불량"],
+        },
     )
-    v2.metric(
-        "입고 원본 행",
-        f"{validation['source_rows'].get('입고', 0):,}",
-    )
-    v3.metric(
-        "불량 원본 수량",
-        f"{validation['source_qty'].get('불량', 0):,.0f}",
-    )
-    v4.metric(
-        "입고 원본 수량",
-        f"{validation['source_qty'].get('입고', 0):,.0f}",
-    )
-
     st.write(
         "음수 수량 행:",
         {
-            "불량": validation["negative_qty_rows"].get("불량", 0),
-            "입고": validation["negative_qty_rows"].get("입고", 0),
+            "입고": validation["negative_qty_rows"]["입고"],
+            "불량": validation["negative_qty_rows"]["불량"],
+            "기초재고": validation["base_negative_rows"],
         },
     )
+    st.write(
+        "날짜 오류 행:",
+        validation["invalid_dates"],
+    )
 
-    if validation["dropped_invalid_dates"]:
-        st.warning(
-            f"작업일이 없거나 날짜로 변환되지 않아 "
-            f"{validation['dropped_invalid_dates']:,}건이 집계에서 제외되었습니다."
-        )
+    if len(validation["base_date_values"]) == 1 and \
+       validation["base_date_values"][0] == "2026-01-01":
+        st.success("기초재고 기준일은 2026-01-01로 확인되었습니다.")
     else:
-        st.success("작업일 누락/오류로 제외된 행은 없습니다.")
+        st.warning(
+            "기초재고 기준일이 2026-01-01 하나로만 구성되어 있지 않습니다. "
+            "현재 파일의 실제 기준일을 확인해주세요."
+        )
 
     defect_check = (
         df[df["출입구분"] == "불량"]
@@ -433,55 +612,56 @@ with st.expander("🔎 원본 데이터 검증 결과", expanded=False):
         .reindex(DEFECT_TYPES_ORDER)
         .fillna(0)
     )
-
-    st.write("불량타입별 원본 집계 검증")
+    defect_check = defect_check.rename(
+        columns={"count": "행수", "sum": "수량"}
+    )
     st.dataframe(
-        defect_check.rename(
-            columns={"count": "행수", "sum": "수량"}
-        ).style.format({"행수": "{:,.0f}", "수량": "{:,.0f}"}),
+        defect_check.style.format(
+            {"행수": "{:,.0f}", "수량": "{:,.0f}"}
+        ),
         use_container_width=True,
     )
 
     st.caption(
-        "※ 원본 불량 데이터는 전표제목 기준으로 테/렌즈/전체/기타로 분류합니다. "
-        "음수 수량은 임의 삭제하지 않고 원본 순수량에 반영합니다."
+        "※ 불량타입 필터는 불량 행에만 적용됩니다. "
+        "기초재고에는 공장/불량타입 정보가 없으므로 SKU 기준으로 재고 흐름에 연결합니다."
     )
 
 
 # ------------------------------------------------------------------
-# 필터
+# 필터 - Excel 필터처럼 전체 체크 상태에서 해제
 # ------------------------------------------------------------------
 st.subheader("🔎 필터")
 
 filter1, filter2, filter3 = st.columns(3)
 
 factory_options = sorted(df["공장"].dropna().unique().tolist())
+defect_type_options = [
+    x for x in DEFECT_TYPES_ORDER if x in set(df["불량타입"])
+]
 
 with filter1:
     selected_factories = st.multiselect(
-        "🏭 공장 선택",
+        "🏭 공장",
         options=factory_options,
         default=factory_options,
-        help="드롭다운에서 체크를 해제하여 원하는 공장만 선택할 수 있습니다.",
+        help="Excel 필터처럼 처음에는 전체 선택됩니다. 체크를 해제해 제외하세요.",
     )
 
 with filter2:
-    defect_type_options = [
-        x for x in DEFECT_TYPES_ORDER if x in set(df["불량타입"])
-    ]
     selected_defect_types = st.multiselect(
-        "🏷️ 불량타입 선택",
+        "🏷️ 불량타입",
         options=defect_type_options,
         default=defect_type_options,
-        help="불량 데이터에만 적용됩니다. 입고 데이터는 불량타입 선택 때문에 제외되지 않습니다.",
+        help="처음에는 전체 선택. 체크 해제한 불량타입만 제외됩니다.",
     )
 
 with filter3:
     selected_kinds = st.multiselect(
-        "📂 데이터 종류 선택",
+        "📂 데이터 종류",
         options=DATA_TYPES_ORDER,
         default=DATA_TYPES_ORDER,
-        help="입고 / 불량 중 원하는 데이터만 체크해 사용할 수 있습니다.",
+        help="처음에는 입고/불량 전체 선택. 체크 해제로 원하는 종류만 남길 수 있습니다.",
     )
 
 filter4, filter5, filter6 = st.columns([1.4, 1.4, 1])
@@ -499,13 +679,8 @@ with filter5:
     )
 
 with filter6:
-    if df["작업일"].notna().any():
-        min_date = df["작업일"].min().date()
-        max_date = df["작업일"].max().date()
-    else:
-        st.error("유효한 작업일 데이터가 없습니다.")
-        st.stop()
-
+    min_date = df["작업일"].min().date()
+    max_date = df["작업일"].max().date()
     date_range = st.date_input(
         "작업일 범위",
         value=(min_date, max_date),
@@ -516,13 +691,8 @@ with filter6:
 if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
     start_date, end_date = date_range
 else:
-    start_date = min_date
-    end_date = max_date
+    start_date, end_date = min_date, max_date
 
-
-# ------------------------------------------------------------------
-# 선택값 검증
-# ------------------------------------------------------------------
 if not selected_factories:
     st.warning("공장을 하나 이상 선택해주세요.")
     st.stop()
@@ -535,10 +705,6 @@ if not selected_defect_types and "불량" in selected_kinds:
     st.warning("불량 데이터를 보려면 불량타입을 하나 이상 선택해주세요.")
     st.stop()
 
-
-# ------------------------------------------------------------------
-# 필터 적용
-# ------------------------------------------------------------------
 filtered = filter_data(
     df=df,
     selected_factories=selected_factories,
@@ -561,196 +727,237 @@ if filtered.empty:
 total_in = filtered.loc[
     filtered["출입구분"] == "입고", "수량"
 ].sum()
-
 total_defect = filtered.loc[
     filtered["출입구분"] == "불량", "수량"
 ].sum()
 
-overall_rate = safe_rate(total_defect, total_in)
+base_filtered = filtered_base_stock(base, filtered)
+total_base = base_filtered["현재고수량"].sum()
+available_total = total_base + total_in
+ending_theoretical = available_total - total_defect
+overall_rate = safe_rate(total_defect, available_total)
+pure_inbound_rate = safe_rate(total_defect, total_in)
 
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1.metric("선택 기초재고", f"{total_base:,.0f}")
+k2.metric("선택 입고", f"{total_in:,.0f}")
+k3.metric("선택 불량", f"{total_defect:,.0f}")
+k4.metric("가용량", f"{available_total:,.0f}")
+k5.metric("가용재고 대비 불량률", f"{overall_rate:.2f}%")
+k6.metric("이론 잔여재고", f"{ending_theoretical:,.0f}")
 
-kpi1.metric("총 입고 수량", f"{total_in:,.0f}")
-kpi2.metric("총 불량 수량", f"{total_defect:,.0f}")
-kpi3.metric("입고 대비 불량률", f"{overall_rate:.2f}%")
-kpi4.metric("필터링 행 수", f"{len(filtered):,}")
-kpi5.metric("SKU 수", f"{filtered['상품코드'].nunique():,}")
+if ending_theoretical < 0:
+    st.warning(
+        "선택 조건에서 기초재고 + 입고 - 불량이 음수입니다. "
+        "이 파일에 없는 판매/출고/이동 등의 재고 감소 거래가 있다면 "
+        "실제 재고 흐름과 다를 수 있으므로 아래 검증표를 확인하세요."
+    )
 
 st.divider()
 
 
 # ------------------------------------------------------------------
-# 월별 요약
+# 월별 재고 흐름
 # ------------------------------------------------------------------
-monthly = monthly_summary(filtered)
-cum = cumulative_summary(monthly)
+monthly = monthly_inventory_summary(filtered, base)
 
-
-# ------------------------------------------------------------------
-# 1. 월별 입고/불량 + 불량률
-# ------------------------------------------------------------------
-st.subheader("📊 월별 입고 수량 / 불량 수량 / 입고 대비 불량률")
+st.subheader("📊 월별 재고 흐름 / 불량률")
 
 fig_month = go.Figure()
+_, defect_colors = chart_colors()
 
 fig_month.add_trace(
     go.Bar(
         x=monthly["년월"],
         y=monthly["입고"],
-        name="입고 수량",
+        name="입고",
         text=monthly["입고"].map(lambda x: f"{x:,.0f}"),
         textposition="outside",
-        marker_color="#1f77b4",
-        opacity=0.75,
+        marker_color="#42A5F5" if get_theme_type() == "dark" else "#1565C0",
+        opacity=0.78,
         hovertemplate="입고: %{y:,.0f}<extra></extra>",
     )
 )
-
 fig_month.add_trace(
     go.Bar(
         x=monthly["년월"],
         y=monthly["불량"],
-        name="불량 수량",
+        name="불량",
         text=monthly["불량"].map(lambda x: f"{x:,.0f}"),
         textposition="outside",
-        marker_color="#d62728",
-        opacity=0.85,
+        marker_color="#EF5350" if get_theme_type() == "dark" else "#C62828",
+        opacity=0.86,
         hovertemplate="불량: %{y:,.0f}<extra></extra>",
     )
 )
-
 fig_month.add_trace(
     go.Scatter(
         x=monthly["년월"],
-        y=monthly["불량률"],
-        name="월별 불량률",
+        y=monthly["월불량률"],
+        name="가용재고 대비 월불량률",
         mode="lines+markers+text",
-        text=monthly["불량률"].map(lambda x: f"{x:.2f}%"),
+        text=monthly["월불량률"].map(lambda x: f"{x:.2f}%"),
         textposition="top center",
-        line=dict(color="#111111", width=3),
+        line=dict(
+            color="#FFD54F" if get_theme_type() == "dark" else "#E65100",
+            width=3,
+        ),
         marker=dict(size=8),
         yaxis="y2",
-        hovertemplate="불량률: %{y:.2f}%<extra></extra>",
+        hovertemplate="가용재고 대비 불량률: %{y:.2f}%<extra></extra>",
     )
 )
-
+fig_month = apply_theme(fig_month, 540)
 fig_month.update_layout(
     barmode="group",
-    height=520,
-    margin=dict(t=60, l=20, r=70, b=20),
-    hovermode="x unified",
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="right",
-        x=1,
-    ),
-    xaxis=dict(title="년월"),
-    yaxis=dict(
-        title="수량",
-        separatethousands=True,
-    ),
+    xaxis_title="년월",
+    yaxis=dict(title="수량", separatethousands=True),
     yaxis2=dict(
         title="불량률 (%)",
         overlaying="y",
         side="right",
         rangemode="tozero",
         ticksuffix="%",
+        showgrid=False,
     ),
 )
-
 st.plotly_chart(fig_month, use_container_width=True)
 
 st.caption(
-    "※ 수량은 막대, 불량률은 별도 라인으로 표시해 입고 대비 불량 수준을 한눈에 구분합니다."
+    "핵심 기준: 월불량률 = 당월 불량 ÷ (월초 이론재고 + 당월 입고). "
+    "기초재고가 존재하므로 단순히 '불량 ÷ 입고'로 계산하지 않습니다."
 )
 
 
 # ------------------------------------------------------------------
-# 2. 누계 추이
+# 월별 누계
 # ------------------------------------------------------------------
-st.subheader("📈 월별 누계 추이")
+st.subheader("📈 월별 누계")
 
-cum_tab1, cum_tab2, cum_tab3 = st.tabs(
-    ["누계 입고", "누계 불량", "누계 불량률"]
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["누계 입고", "누계 불량", "누계 이론재고", "누계 불량률"]
 )
 
-with cum_tab1:
-    fig_cin = go.Figure()
-    fig_cin.add_trace(
+def line_chart(x, y, name, title, y_title, suffix="", color_light="#1565C0", color_dark="#64B5F6"):
+    fig = go.Figure()
+    color = color_dark if get_theme_type() == "dark" else color_light
+    fig.add_trace(
         go.Scatter(
-            x=cum["년월"],
-            y=cum["입고누계"],
+            x=x,
+            y=y,
+            name=name,
             mode="lines+markers+text",
-            text=cum["입고누계"].map(lambda x: f"{x:,.0f}"),
+            text=[
+                f"{v:,.2f}{suffix}" if suffix else f"{v:,.0f}"
+                for v in y
+            ],
             textposition="top center",
-            name="입고 누계",
-            line=dict(color="#1f77b4", width=4),
+            line=dict(color=color, width=4),
+            marker=dict(size=8),
         )
     )
-    fig_cin.update_layout(
-        height=420,
+    fig = apply_theme(fig, 420)
+    fig.update_layout(
+        title=title,
         xaxis_title="년월",
-        yaxis_title="누계 입고 수량",
-        hovermode="x unified",
-        margin=dict(t=30, l=20, r=20, b=20),
+        yaxis_title=y_title,
+        yaxis=dict(ticksuffix=suffix),
     )
-    st.plotly_chart(fig_cin, use_container_width=True)
+    return fig
 
-with cum_tab2:
-    fig_cdef = go.Figure()
-    fig_cdef.add_trace(
-        go.Scatter(
-            x=cum["년월"],
-            y=cum["불량누계"],
-            mode="lines+markers+text",
-            text=cum["불량누계"].map(lambda x: f"{x:,.0f}"),
-            textposition="top center",
-            name="불량 누계",
-            line=dict(color="#d62728", width=4),
-        )
+with tab1:
+    st.plotly_chart(
+        line_chart(
+            monthly["년월"],
+            monthly["누적입고"],
+            "누계 입고",
+            "누계 입고 수량",
+            "수량",
+            color_light="#1565C0",
+            color_dark="#64B5F6",
+        ),
+        use_container_width=True,
     )
-    fig_cdef.update_layout(
-        height=420,
-        xaxis_title="년월",
-        yaxis_title="누계 불량 수량",
-        hovermode="x unified",
-        margin=dict(t=30, l=20, r=20, b=20),
-    )
-    st.plotly_chart(fig_cdef, use_container_width=True)
 
-with cum_tab3:
-    fig_crate = go.Figure()
-    fig_crate.add_trace(
-        go.Scatter(
-            x=cum["년월"],
-            y=cum["누계불량률"],
-            mode="lines+markers+text",
-            text=cum["누계불량률"].map(lambda x: f"{x:.2f}%"),
-            textposition="top center",
-            name="누계 불량률",
-            line=dict(color="#111111", width=4),
-            fill="tozeroy",
-        )
+with tab2:
+    st.plotly_chart(
+        line_chart(
+            monthly["년월"],
+            monthly["누적불량"],
+            "누계 불량",
+            "누계 불량 수량",
+            "수량",
+            color_light="#C62828",
+            color_dark="#EF5350",
+        ),
+        use_container_width=True,
     )
-    fig_crate.update_layout(
-        height=420,
-        xaxis_title="년월",
-        yaxis_title="누계 불량률 (%)",
-        hovermode="x unified",
-        margin=dict(t=30, l=20, r=20, b=20),
-        yaxis=dict(ticksuffix="%"),
-    )
-    st.plotly_chart(fig_crate, use_container_width=True)
 
-st.caption(
-    "※ 기존처럼 좌우 축에 입고/불량 누계 수량을 겹쳐 그리지 않고 각각 분리했습니다."
-)
+with tab3:
+    st.plotly_chart(
+        line_chart(
+            monthly["년월"],
+            monthly["월말이론재고"],
+            "월말 이론재고",
+            "기초재고 + 누계 입고 - 누계 불량",
+            "이론재고",
+            color_light="#2E7D32",
+            color_dark="#81C784",
+        ),
+        use_container_width=True,
+    )
+
+with tab4:
+    st.plotly_chart(
+        line_chart(
+            monthly["년월"],
+            monthly["누계불량률"],
+            "누계 가용재고 대비 불량률",
+            "누계 가용재고 대비 불량률",
+            "불량률",
+            suffix="%",
+            color_light="#E65100",
+            color_dark="#FFD54F",
+        ),
+        use_container_width=True,
+    )
 
 
 # ------------------------------------------------------------------
-# 3. 불량타입 월별 그래프
+# 월별 숫자 검증표
+# ------------------------------------------------------------------
+with st.expander("📋 월별 계산 검증표", expanded=False):
+    show_month = monthly[
+        [
+            "년월", "기초재고", "월초이론재고", "입고", "당월가용재고",
+            "불량", "월말이론재고", "월불량률",
+            "누적입고", "누적불량", "누계불량률",
+            "순수입고대비불량률",
+        ]
+    ].copy()
+
+    st.dataframe(
+        show_month.style.format(
+            {
+                "기초재고": "{:,.0f}",
+                "월초이론재고": "{:,.0f}",
+                "입고": "{:,.0f}",
+                "당월가용재고": "{:,.0f}",
+                "불량": "{:,.0f}",
+                "월말이론재고": "{:,.0f}",
+                "월불량률": "{:.2f}%",
+                "누적입고": "{:,.0f}",
+                "누적불량": "{:,.0f}",
+                "누계불량률": "{:.2f}%",
+                "순수입고대비불량률": "{:.2f}%",
+            }
+        ),
+        use_container_width=True,
+    )
+
+
+# ------------------------------------------------------------------
+# 불량타입
 # ------------------------------------------------------------------
 st.divider()
 st.subheader("🏷️ 불량타입별 월별 수량")
@@ -766,77 +973,52 @@ else:
         .unstack(fill_value=0)
         .sort_index()
     )
-
     for col in DEFECT_TYPES_ORDER:
         if col not in type_monthly.columns:
             type_monthly[col] = 0
-
     type_monthly = type_monthly[DEFECT_TYPES_ORDER]
 
     tab_main, tab_minor, tab_table = st.tabs(
         ["주요 타입 · 테 / 렌즈", "군소 타입 · 전체 / 기타", "수량 검증표"]
     )
 
-    def make_defect_group_chart(
-        data: pd.DataFrame,
-        types: List[str],
-        title: str,
-    ):
+    def make_defect_group_chart(data, types, title):
+        _, colors = chart_colors()
         fig = go.Figure()
-
         for defect_type in types:
-            if defect_type not in data.columns:
-                continue
-
             fig.add_trace(
                 go.Bar(
                     x=data.index,
                     y=data[defect_type],
                     name=defect_type,
-                    marker_color=DEFECT_TYPE_COLORS[defect_type],
+                    marker_color=colors[defect_type],
                     text=data[defect_type].map(
                         lambda x: f"{x:,.0f}" if x != 0 else ""
                     ),
                     textposition="outside",
                     hovertemplate=(
-                        f"{defect_type}: "
-                        "%{y:,.0f}<extra></extra>"
+                        f"{defect_type}: %{y:,.0f}<extra></extra>"
                     ),
                 )
             )
-
+        fig = apply_theme(fig, 500)
         fig.update_layout(
             title=title,
             barmode="group",
-            height=500,
             xaxis_title="년월",
             yaxis_title="불량 수량",
-            hovermode="x unified",
-            margin=dict(t=60, l=20, r=20, b=20),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="right",
-                x=1,
-            ),
         )
-
         return fig
 
     with tab_main:
         main_types = [
             x for x in ["테", "렌즈"]
-            if x in type_monthly.columns
-            and (type_monthly[x].abs().sum() != 0)
+            if type_monthly[x].abs().sum() != 0
         ]
-
         if main_types:
             st.plotly_chart(
                 make_defect_group_chart(
-                    type_monthly,
-                    main_types,
-                    "테 / 렌즈 월별 불량 수량",
+                    type_monthly, main_types, "테 / 렌즈 월별 불량 수량"
                 ),
                 use_container_width=True,
             )
@@ -846,40 +1028,32 @@ else:
     with tab_minor:
         minor_types = [
             x for x in ["전체", "기타"]
-            if x in type_monthly.columns
-            and (type_monthly[x].abs().sum() != 0)
+            if type_monthly[x].abs().sum() != 0
         ]
-
         if minor_types:
             st.plotly_chart(
                 make_defect_group_chart(
-                    type_monthly,
-                    minor_types,
-                    "전체 / 기타 월별 불량 수량",
+                    type_monthly, minor_types, "전체 / 기타 월별 불량 수량"
                 ),
                 use_container_width=True,
             )
         else:
-            st.info(
-                "현재 선택 조건에서는 전체/기타 불량 수량이 없습니다."
-            )
+            st.info("전체/기타 데이터가 없습니다.")
 
     with tab_table:
         check_table = type_monthly.copy()
         check_table["불량 합계"] = check_table.sum(axis=1)
-
         st.dataframe(
             check_table.style.format("{:,.0f}"),
             use_container_width=True,
         )
-
         st.caption(
-            "※ 스택형 그래프를 제거했습니다. 각 타입의 막대가 같은 기준선에서 나란히 표시됩니다."
+            "그룹형 막대그래프이므로 각 타입이 같은 기준선에서 직접 비교됩니다."
         )
 
 
 # ------------------------------------------------------------------
-# 4. 공장별 현황
+# 공장별
 # ------------------------------------------------------------------
 st.divider()
 st.subheader("🏭 공장별 입고 / 불량 / 불량률")
@@ -889,57 +1063,83 @@ factory_summary = (
     .sum()
     .unstack(fill_value=0)
 )
-
 for col in DATA_TYPES_ORDER:
     if col not in factory_summary.columns:
         factory_summary[col] = 0
+factory_summary = factory_summary[DATA_TYPES_ORDER]
 
-factory_summary = factory_summary[DATA_TYPES_ORDER].copy()
+# 공장별 기초재고는 기초재고에 공장 정보가 없으므로
+# 거래에 등장하는 SKU를 기준으로 연결.
+factory_base_rows = []
+for factory in factory_summary.index:
+    tx_factory = filtered[filtered["공장"] == factory]
+    b = filtered_base_stock(base, tx_factory)
+    factory_base_rows.append(
+        {
+            "공장": factory,
+            "기초재고": b["현재고수량"].sum(),
+        }
+    )
+factory_base = pd.DataFrame(factory_base_rows).set_index("공장")
+
+factory_summary["기초재고"] = factory_base["기초재고"].reindex(
+    factory_summary.index
+).fillna(0)
+factory_summary["가용량"] = (
+    factory_summary["기초재고"] + factory_summary["입고"]
+)
 factory_summary["불량률"] = (
     factory_summary["불량"]
-    .div(factory_summary["입고"].replace(0, pd.NA))
+    .div(factory_summary["가용량"].replace(0, pd.NA))
     * 100
 ).fillna(0)
+factory_summary["이론잔여재고"] = (
+    factory_summary["가용량"] - factory_summary["불량"]
+)
+
+factory_colors, _ = chart_colors()
 
 fig_factory = go.Figure()
-
 fig_factory.add_trace(
     go.Bar(
         x=factory_summary.index,
         y=factory_summary["입고"],
         name="입고",
         marker_color=[
-            FACTORY_COLORS.get(x, "#7f7f7f")
+            factory_colors.get(x, factory_colors["미상"])
             for x in factory_summary.index
         ],
     )
 )
-
 fig_factory.add_trace(
     go.Bar(
         x=factory_summary.index,
         y=factory_summary["불량"],
         name="불량",
-        marker_color="#d62728",
+        marker_color=(
+            "#EF5350" if get_theme_type() == "dark" else "#C62828"
+        ),
     )
 )
-
 fig_factory.add_trace(
     go.Scatter(
         x=factory_summary.index,
         y=factory_summary["불량률"],
-        name="불량률",
+        name="가용량 대비 불량률",
         mode="lines+markers+text",
         text=factory_summary["불량률"].map(lambda x: f"{x:.2f}%"),
         textposition="top center",
         yaxis="y2",
-        line=dict(color="#111111", width=3),
+        line=dict(
+            color="#FFD54F" if get_theme_type() == "dark" else "#E65100",
+            width=3,
+        ),
+        marker=dict(size=9),
     )
 )
-
+fig_factory = apply_theme(fig_factory, 480)
 fig_factory.update_layout(
     barmode="group",
-    height=480,
     xaxis_title="공장",
     yaxis=dict(title="수량"),
     yaxis2=dict(
@@ -948,19 +1148,20 @@ fig_factory.update_layout(
         side="right",
         rangemode="tozero",
         ticksuffix="%",
+        showgrid=False,
     ),
-    hovermode="x unified",
-    margin=dict(t=40, l=20, r=70, b=20),
 )
-
 st.plotly_chart(fig_factory, use_container_width=True)
 
 st.dataframe(
     factory_summary.style.format(
         {
+            "기초재고": "{:,.0f}",
             "입고": "{:,.0f}",
             "불량": "{:,.0f}",
+            "가용량": "{:,.0f}",
             "불량률": "{:.2f}%",
+            "이론잔여재고": "{:,.0f}",
         }
     ),
     use_container_width=True,
@@ -968,140 +1169,131 @@ st.dataframe(
 
 
 # ------------------------------------------------------------------
-# 5. SKU별 입고 대비 불량률
+# SKU 위험도
 # ------------------------------------------------------------------
 st.divider()
-st.subheader("🚨 입고 대비 불량률이 높은 SKU")
+st.subheader("🚨 기초재고 + 입고 기준 SKU별 불량 위험")
 
-sku_col1, sku_col2 = st.columns([1, 1])
-
-with sku_col1:
-    min_inbound_qty = st.number_input(
-        "최소 입고 수량",
+s1, s2 = st.columns([1, 1])
+with s1:
+    min_available_qty = st.number_input(
+        "최소 가용량",
         min_value=1,
         value=100,
         step=10,
         help=(
-            "입고 수량이 너무 작은 SKU가 불량 1~2개만으로 "
-            "불량률 100%에 가까워지는 것을 방지합니다."
+            "기초재고 + 누적 입고가 너무 작은 SKU는 작은 불량 몇 개만으로 "
+            "불량률이 과도하게 커질 수 있어 최소 기준을 둡니다."
         ),
     )
-
-with sku_col2:
+with s2:
     top_n = st.number_input(
         "표시 SKU 수",
         min_value=5,
         max_value=100,
-        value=20,
+        value=30,
         step=5,
     )
 
-sku_table = sku_defect_rate_table(
+sku_table = sku_risk_table(
     filtered=filtered,
-    min_inbound_qty=int(min_inbound_qty),
-    top_n=int(top_n),
+    base=base,
+    min_available_qty=min_available_qty,
+    top_n=top_n,
 )
 
 if sku_table.empty:
-    st.info(
-        "조건을 만족하는 SKU가 없습니다. 최소 입고 수량을 낮춰보세요."
-    )
+    st.info("현재 조건에서 최소 가용량 조건을 만족하는 SKU가 없습니다.")
 else:
     st.dataframe(
         sku_table.style.format(
             {
+                "기초재고": "{:,.0f}",
                 "입고수량": "{:,.0f}",
+                "가용량": "{:,.0f}",
                 "불량수량": "{:,.0f}",
                 "불량률": "{:.2f}%",
+                "월말이론재고": "{:,.0f}",
             }
         ),
         use_container_width=True,
-        height=520,
     )
-
     st.caption(
-        "※ SKU 불량률 = 선택된 조건의 불량 수량 ÷ 선택된 조건의 입고 수량 × 100. "
-        "상품코드가 같은 입고/불량 데이터를 연결하여 계산합니다."
+        "불량률 = 누적 불량 ÷ (기초재고 + 누적 입고). "
+        "'점검필요(음수)'는 해당 SKU의 기초재고 + 입고보다 불량이 많다는 뜻입니다."
     )
 
 
 # ------------------------------------------------------------------
-# 6. 불량타입별 총합
+# 재고 흐름 이상 SKU
 # ------------------------------------------------------------------
 st.divider()
-st.subheader("📋 불량타입별 총 수량 / 비중")
+st.subheader("⚠️ 재고 흐름 점검")
 
-type_total = (
-    defect_only.groupby("불량타입")["수량"]
-    .sum()
-    .reindex(DEFECT_TYPES_ORDER)
-    .fillna(0)
-    .to_frame("불량수량")
-)
+flow_check = stock_flow_validation(filtered, base)
 
-type_total["비중"] = (
-    type_total["불량수량"] /
-    type_total["불량수량"].sum() * 100
-).fillna(0)
+if flow_check.empty:
+    st.info("검증할 SKU가 없습니다.")
+else:
+    issue = flow_check[flow_check["상태"] == "점검필요"].copy()
+    f1, f2, f3 = st.columns(3)
+    f1.metric("검증 SKU", f"{len(flow_check):,}")
+    f2.metric("음수 이론재고 SKU", f"{len(issue):,}")
+    f3.metric(
+        "음수 이론재고 합계",
+        f"{issue['이론재고'].sum():,.0f}" if not issue.empty else "0",
+    )
 
-type_total["누계"] = type_total["불량수량"].cumsum()
+    if issue.empty:
+        st.success(
+            "현재 선택 조건에서는 기초재고 + 입고 - 불량이 음수가 되는 SKU가 없습니다."
+        )
+    else:
+        st.warning(
+            "아래 SKU는 기초재고 + 입고만으로는 기록된 불량량을 설명할 수 없습니다. "
+            "판매/출고/이동 등 다른 재고 감소 거래가 원본에 없는지 확인해야 합니다."
+        )
+        st.dataframe(
+            issue.head(100).style.format(
+                {
+                    "기초재고": "{:,.0f}",
+                    "입고수량": "{:,.0f}",
+                    "불량수량": "{:,.0f}",
+                    "가용량": "{:,.0f}",
+                    "이론재고": "{:,.0f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+
+# ------------------------------------------------------------------
+# 상세 데이터
+# ------------------------------------------------------------------
+st.divider()
+st.subheader("📄 필터링된 원본 데이터")
+
+display_cols = [
+    c for c in [
+        "작업일", "출입구분", "공장", "불량타입",
+        "상품코드", "상품명", "수량", "전표제목",
+        "공급처 상품명", "현재고", "작업자", "전표번호"
+    ] if c in filtered.columns
+]
 
 st.dataframe(
-    type_total.style.format(
-        {
-            "불량수량": "{:,.0f}",
-            "비중": "{:.2f}%",
-            "누계": "{:,.0f}",
-        }
+    filtered[display_cols].sort_values(
+        ["작업일", "출입구분", "상품코드"],
+        ascending=[True, True, True],
     ),
     use_container_width=True,
+    height=500,
 )
 
-
-# ------------------------------------------------------------------
-# 7. 상세 데이터
-# ------------------------------------------------------------------
-st.divider()
-st.subheader("📋 상세 데이터")
-
-display_cols = [
-    "작업일",
-    "년월",
-    "출입구분",
-    "공장",
-    "불량타입",
-    "공급처",
-    "공급처 상품명",
-    "상품코드",
-    "상품명",
-    "옵션",
-    "수량",
-    "전표제목",
-    "전표번호",
-]
-
-display_cols = [
-    c for c in display_cols if c in filtered.columns
-]
-
-detail = filtered[display_cols].sort_values(
-    "작업일",
-    ascending=False,
-)
-
-st.dataframe(
-    detail,
-    use_container_width=True,
-    height=450,
-)
-
-csv_bytes = detail.to_csv(
-    index=False
-).encode("utf-8-sig")
-
+csv = filtered[display_cols].to_csv(index=False, encoding="utf-8-sig")
 st.download_button(
-    label="⬇️ 현재 필터 데이터 CSV 다운로드",
-    data=csv_bytes,
-    file_name="filtered_data.csv",
+    "⬇️ 현재 필터 데이터 CSV 다운로드",
+    data=csv,
+    file_name="입고_불량_필터데이터.csv",
     mime="text/csv",
 )
