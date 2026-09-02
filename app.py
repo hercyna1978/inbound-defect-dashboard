@@ -4,19 +4,34 @@
 입고 / 출고 / 불량 / 기초재고 / 상품마스터 대시보드
 =====================================================
 
-핵심 계산 기준
-1. 2026-01-01 기초재고를 시작 재고로 사용
-2. 입고 월별 집계 기준 = 작업일
-3. 출고 월별 집계 기준 = 작업일
-   - 출고 시트에 작업일이 있으면 작업일 사용
-   - 작업일이 없을 경우에만 출고일을 보조 사용
-4. 불량 월별 집계 기준 = 작업일
-5. 월별 입고/출고/불량은 원본 행을 해당 월로 직접 groupby하여 합산
-6. 누계 = 월별 합계의 누적합
-7. 이론재고 = 기초재고 + 누계입고 - 누계출고 - 누계불량
-8. 실제검수수량 = 출고 + 불량
-9. 검수 기준 불량률 = 불량 / (출고 + 불량)
-10. 아직 검수하지 않은 잔여재고는 불량률 분모에 포함하지 않음
+핵심 집계 원칙
+1. 입고
+   - 입고 시트의 '수량'을 그대로 사용
+   - 날짜는 '작업일' 사용
+
+2. 출고
+   - 출고 시트의 '출고수량'을 그대로 사용
+   - '작업일'이 있으면 작업일 사용
+   - 작업일이 없을 경우에만 '출고일' 사용
+
+3. 불량
+   - 불량 시트의 '수량'을 그대로 사용
+   - 날짜는 '작업일' 사용
+
+4. 상품마스터
+   - 상품코드 기준으로 1:1 연결
+   - 중복 상품코드는 첫 번째 행만 사용
+   - 마스터 연결 때문에 거래 수량이 증가하지 않도록 처리
+
+5. 실제 검수
+   - 실제검수수량 = 출고 + 불량
+
+6. 검수 기준 불량률
+   - 불량률 = 불량 / (출고 + 불량)
+   - 아직 검수하지 않은 재고는 분모에 포함하지 않음
+
+7. 기초재고
+   - 2026-01-01 기초재고 사용
 """
 
 import io
@@ -29,7 +44,7 @@ import streamlit as st
 
 
 # ============================================================
-# 기본 설정
+# Streamlit 기본 설정
 # ============================================================
 
 st.set_page_config(
@@ -37,6 +52,11 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
+
+
+# ============================================================
+# 기본 설정
+# ============================================================
 
 DEFAULT_DATA_PATH = os.path.join(
     os.path.dirname(__file__),
@@ -74,35 +94,27 @@ DATA_TYPES_ORDER = [
 
 
 # ============================================================
-# 색상
-# ============================================================
-
-FACTORY_COLORS_LIGHT = {
-    "C5공장": "#1565C0",
-    "C2공장": "#2E7D32",
-    "C2-S공장": "#EF6C00",
-    "미상": "#757575",
-}
-
-FACTORY_COLORS_DARK = {
-    "C5공장": "#64B5F6",
-    "C2공장": "#81C784",
-    "C2-S공장": "#FFB74D",
-    "미상": "#BDBDBD",
-}
-
-
-# ============================================================
 # 필수 컬럼
 # ============================================================
 
-REQUIRED_TRANSACTION_COLUMNS = [
+REQUIRED_INBOUND_COLUMNS = [
     "작업일",
     "수량",
-    "공급처 상품명",
     "상품코드",
     "상품명",
-    "전표제목",
+]
+
+REQUIRED_DEFECT_COLUMNS = [
+    "작업일",
+    "수량",
+    "상품코드",
+    "상품명",
+]
+
+REQUIRED_OUTBOUND_COLUMNS = [
+    "상품코드",
+    "상품명",
+    "출고수량",
 ]
 
 REQUIRED_BASE_COLUMNS = [
@@ -110,12 +122,6 @@ REQUIRED_BASE_COLUMNS = [
     "상품코드",
     "상품명",
     "현재고수량",
-]
-
-REQUIRED_OUTBOUND_COLUMNS = [
-    "상품코드",
-    "상품명",
-    "출고수량",
 ]
 
 REQUIRED_MASTER_COLUMNS = [
@@ -127,7 +133,7 @@ REQUIRED_MASTER_COLUMNS = [
 
 
 # ============================================================
-# 화면 테마
+# 테마
 # ============================================================
 
 def get_theme_type() -> str:
@@ -137,7 +143,6 @@ def get_theme_type() -> str:
 
         if theme_type in ("dark", "light"):
             return theme_type
-
     except Exception:
         pass
 
@@ -146,24 +151,16 @@ def get_theme_type() -> str:
 
         if base in ("dark", "light"):
             return base
-
     except Exception:
         pass
 
     return "light"
 
 
-def apply_theme(
-    fig: go.Figure,
-    height: int = 480,
-):
+def apply_theme(fig: go.Figure, height: int = 450):
     dark = get_theme_type() == "dark"
 
-    template = (
-        "plotly_dark"
-        if dark
-        else "plotly_white"
-    )
+    template = "plotly_dark" if dark else "plotly_white"
 
     grid_color = (
         "rgba(255,255,255,0.15)"
@@ -211,48 +208,6 @@ def apply_theme(
 
 
 # ============================================================
-# DataFrame 표시
-# 인덱스는 내부적으로 유지하되 화면에서는 숨김
-# ============================================================
-
-def show_dataframe(
-    data: pd.DataFrame,
-    format_dict=None,
-    use_container_width=True,
-    height=None,
-):
-    """
-    Streamlit 화면에서 DataFrame index를 숨긴다.
-    CSV 다운로드 등 원본 데이터에는 영향을 주지 않는다.
-    """
-
-    styled = data.style
-
-    if format_dict:
-        styled = styled.format(format_dict)
-
-    try:
-        styled = styled.hide(axis="index")
-    except Exception:
-        try:
-            styled = styled.hide_index()
-        except Exception:
-            pass
-
-    kwargs = {
-        "use_container_width": use_container_width,
-    }
-
-    if height is not None:
-        kwargs["height"] = height
-
-    st.dataframe(
-        styled,
-        **kwargs,
-    )
-
-
-# ============================================================
 # 기본 분류 함수
 # ============================================================
 
@@ -263,7 +218,7 @@ def classify_factory(value) -> str:
 
     text = str(value).strip().upper()
 
-    if text == "":
+    if not text:
         return "미상"
 
     if "C2-S" in text or "C2S" in text:
@@ -301,17 +256,17 @@ def classify_defect_type(value) -> str:
 
     text = str(value).strip()
 
-    if text == "":
+    if not text:
         return "기타"
 
     if "전체" in text:
         return "전체"
 
-    if "테" in text:
-        return "테"
-
     if "렌즈" in text:
         return "렌즈"
+
+    if "테" in text:
+        return "테"
 
     return "기타"
 
@@ -320,9 +275,7 @@ def classify_defect_type(value) -> str:
 # 상품코드 정규화
 # ============================================================
 
-def normalize_code(
-    series: pd.Series,
-) -> pd.Series:
+def normalize_code(series: pd.Series) -> pd.Series:
 
     s = (
         series
@@ -331,7 +284,7 @@ def normalize_code(
         .str.strip()
     )
 
-    # Excel 숫자형 상품코드에서 발생하는 12345.0 제거
+    # Excel 숫자형으로 읽힌 12345.0 제거
     s = s.str.replace(
         r"\.0$",
         "",
@@ -342,72 +295,89 @@ def normalize_code(
 
 
 # ============================================================
-# 상품마스터 처리
+# 숫자 변환
+# ============================================================
+
+def numeric_series(series: pd.Series) -> pd.Series:
+
+    return pd.to_numeric(
+        series,
+        errors="coerce",
+    ).fillna(0)
+
+
+# ============================================================
+# 상품마스터 준비
 # ============================================================
 
 def prepare_master(
-    master: pd.DataFrame,
+    master_raw: pd.DataFrame,
 ) -> pd.DataFrame:
 
     missing = [
         c
         for c in REQUIRED_MASTER_COLUMNS
-        if c not in master.columns
+        if c not in master_raw.columns
     ]
 
     if missing:
         raise ValueError(
-            f"'상품마스터' 시트에 필수 컬럼이 없습니다: {missing}"
+            "'상품마스터' 시트에 다음 컬럼이 없습니다: "
+            f"{missing}"
         )
 
-    m = master.copy()
+    master = master_raw.copy()
 
-    m["상품코드"] = normalize_code(
-        m["상품코드"]
+    master["상품코드"] = normalize_code(
+        master["상품코드"]
     )
 
-    m["상품명"] = (
-        m["상품명"]
+    master["상품명"] = (
+        master["상품명"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
 
-    m["공장명"] = (
-        m["공장명"]
+    master["공장명"] = (
+        master["공장명"]
         .fillna("")
         .astype(str)
         .str.strip()
     )
 
-    m["카테고리"] = (
-        m["카테고리"]
+    master["카테고리"] = (
+        master["카테고리"]
         .fillna("")
         .astype(str)
         .str.strip()
         .str.upper()
     )
 
-    # 동일 상품코드가 여러 번 존재하는 경우 첫 번째 기준정보 사용
-    m = (
-        m.drop_duplicates(
-            subset=["상품코드"],
-            keep="first",
-        )
-        .copy()
+    # --------------------------------------------------------
+    # 중요
+    # 상품마스터 중복 SKU 때문에 거래 데이터가
+    # 여러 행으로 복제되는 것을 방지
+    # --------------------------------------------------------
+
+    master = master[
+        master["상품코드"].ne("")
+    ].copy()
+
+    master = master.drop_duplicates(
+        subset=["상품코드"],
+        keep="first",
+    ).copy()
+
+    master["공장"] = master["공장명"].apply(
+        classify_factory
     )
 
-    m["공장"] = (
-        m["공장명"]
-        .apply(classify_factory)
+    master["카테고리"] = master["카테고리"].apply(
+        classify_category
     )
 
-    m["카테고리"] = (
-        m["카테고리"]
-        .apply(classify_category)
-    )
-
-    return m
+    return master
 
 
 # ============================================================
@@ -419,175 +389,112 @@ def attach_master(
     master: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    out = df.copy()
+    result = df.copy()
 
-    out["상품코드"] = normalize_code(
-        out["상품코드"]
+    result["상품코드"] = normalize_code(
+        result["상품코드"]
     )
 
-    lookup = master[
-        [
-            "상품코드",
-            "상품명",
-            "공장",
-            "카테고리",
-        ]
-    ].copy()
+    # --------------------------------------------------------
+    # merge가 아닌 map 방식 사용
+    #
+    # 상품마스터 SKU 중복으로 거래 행이 증가하는 것을
+    # 원천적으로 방지
+    # --------------------------------------------------------
 
-    lookup = lookup.rename(
-        columns={
-            "상품명": "마스터상품명",
-            "공장": "마스터공장",
-            "카테고리": "마스터카테고리",
-        }
+    factory_map = (
+        master
+        .set_index("상품코드")["공장"]
+        .to_dict()
     )
 
-    out = out.merge(
-        lookup,
-        on="상품코드",
-        how="left",
+    category_map = (
+        master
+        .set_index("상품코드")["카테고리"]
+        .to_dict()
     )
 
-    out["공장"] = (
-        out["마스터공장"]
+    master_name_map = (
+        master
+        .set_index("상품코드")["상품명"]
+        .to_dict()
+    )
+
+    result["공장"] = (
+        result["상품코드"]
+        .map(factory_map)
         .fillna("미상")
     )
 
-    out["카테고리"] = (
-        out["마스터카테고리"]
+    result["카테고리"] = (
+        result["상품코드"]
+        .map(category_map)
         .fillna("미상")
     )
 
-    if "상품명" in out.columns:
+    # 상품마스터 상품명을 우선 사용
+    master_names = (
+        result["상품코드"]
+        .map(master_name_map)
+    )
 
-        original_name = (
-            out["상품명"]
+    if "상품명" in result.columns:
+
+        original_names = (
+            result["상품명"]
             .fillna("")
             .astype(str)
+            .str.strip()
         )
 
-        master_name = (
-            out["마스터상품명"]
+        result["상품명"] = (
+            master_names
             .fillna("")
             .astype(str)
-        )
-
-        out["상품명"] = (
-            master_name
             .where(
-                master_name.ne(""),
-                original_name,
+                master_names
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .ne(""),
+                original_names,
             )
         )
 
-    out = out.drop(
-        columns=[
-            "마스터상품명",
-            "마스터공장",
-            "마스터카테고리",
-        ],
-        errors="ignore",
-    )
-
-    return out
+    return result
 
 
 # ============================================================
-# Excel Sheet 읽기
-# ============================================================
-
-def read_sheet(
-    file_source,
-    sheet_name: str,
-) -> pd.DataFrame:
-
-    return pd.read_excel(
-        file_source,
-        sheet_name=sheet_name,
-    )
-
-
-# ============================================================
-# 출고 작업일 결정
-# ============================================================
-
-def resolve_outbound_work_date(
-    outbound: pd.DataFrame,
-) -> pd.Series:
-    """
-    출고 월별 계산에서 사용하는 날짜.
-
-    우선순위:
-    1. 작업일
-    2. 출고일
-
-    따라서 원본 출고 시트에 작업일이 있다면
-    반드시 작업일 기준으로 월을 계산한다.
-    """
-
-    if "작업일" in outbound.columns:
-
-        work_date = pd.to_datetime(
-            outbound["작업일"],
-            errors="coerce",
-        )
-
-        # 작업일이 비어 있는 행만 출고일로 보조
-        if "출고일" in outbound.columns:
-
-            fallback = pd.to_datetime(
-                outbound["출고일"],
-                errors="coerce",
-            )
-
-            work_date = work_date.fillna(
-                fallback
-            )
-
-        return work_date
-
-    if "출고일" in outbound.columns:
-
-        return pd.to_datetime(
-            outbound["출고일"],
-            errors="coerce",
-        )
-
-    raise ValueError(
-        "출고 시트에 '작업일' 또는 '출고일' 컬럼이 없습니다."
-    )
-
-
-# ============================================================
-# 데이터 로딩
+# 원본 데이터 로딩
 # ============================================================
 
 @st.cache_data(
     show_spinner="엑셀 데이터를 불러오는 중입니다..."
 )
-def load_and_process(
+def load_data(
     file_bytes: bytes,
 ) -> Tuple[
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
+    dict,
 ]:
 
-    source = io.BytesIO(
-        file_bytes
-    )
+    source = io.BytesIO(file_bytes)
 
-    # --------------------------------------------------------
+    # ========================================================
     # 상품마스터
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
-        master_raw = read_sheet(
+
+        master_raw = pd.read_excel(
             source,
-            "상품마스터",
+            sheet_name="상품마스터",
         )
 
     except Exception as e:
+
         raise ValueError(
             f"'상품마스터' 시트를 읽을 수 없습니다: {e}"
         )
@@ -596,200 +503,399 @@ def load_and_process(
         master_raw
     )
 
-    frames = []
-
-    # --------------------------------------------------------
-    # 입고 / 불량
-    # --------------------------------------------------------
-
-    for sheet_name, data_kind in [
-        ("입고", "입고"),
-        ("불량", "불량"),
-    ]:
-
-        try:
-            tx = read_sheet(
-                source,
-                sheet_name,
-            )
-
-        except Exception as e:
-            raise ValueError(
-                f"'{sheet_name}' 시트를 읽을 수 없습니다: {e}"
-            )
-
-        missing = [
-            c
-            for c in REQUIRED_TRANSACTION_COLUMNS
-            if c not in tx.columns
-        ]
-
-        if missing:
-            raise ValueError(
-                f"'{sheet_name}' 시트에 필수 컬럼이 없습니다: {missing}"
-            )
-
-        tx = tx.copy()
-
-        # ★ 입고 / 불량은 원본 작업일을 그대로 사용
-        tx["작업일"] = pd.to_datetime(
-            tx["작업일"],
-            errors="coerce",
-        )
-
-        tx["수량"] = pd.to_numeric(
-            tx["수량"],
-            errors="coerce",
-        ).fillna(0)
-
-        tx["상품코드"] = normalize_code(
-            tx["상품코드"]
-        )
-
-        tx["출입구분"] = data_kind
-
-        for col in [
-            "상품명",
-            "공급처",
-            "공급처 상품명",
-            "전표제목",
-        ]:
-
-            if col in tx.columns:
-
-                tx[col] = (
-                    tx[col]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                )
-
-        tx = attach_master(
-            tx,
-            master,
-        )
-
-        if data_kind == "불량":
-
-            tx["불량타입"] = (
-                tx["전표제목"]
-                .apply(classify_defect_type)
-            )
-
-        else:
-
-            tx["불량타입"] = "기타"
-
-        frames.append(
-            tx
-        )
-
-    # --------------------------------------------------------
-    # 출고
-    # --------------------------------------------------------
+    # ========================================================
+    # 입고
+    # ========================================================
 
     try:
-        outbound = read_sheet(
+
+        inbound_raw = pd.read_excel(
             source,
-            "출고",
+            sheet_name="입고",
         )
 
     except Exception as e:
+
+        raise ValueError(
+            f"'입고' 시트를 읽을 수 없습니다: {e}"
+        )
+
+    missing = [
+        c
+        for c in REQUIRED_INBOUND_COLUMNS
+        if c not in inbound_raw.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            f"'입고' 시트에 필수 컬럼이 없습니다: {missing}"
+        )
+
+    inbound = inbound_raw.copy()
+
+    inbound["작업일"] = pd.to_datetime(
+        inbound["작업일"],
+        errors="coerce",
+    )
+
+    inbound["수량"] = numeric_series(
+        inbound["수량"]
+    )
+
+    inbound["상품코드"] = normalize_code(
+        inbound["상품코드"]
+    )
+
+    inbound["상품명"] = (
+        inbound["상품명"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    inbound["출입구분"] = "입고"
+
+    if "전표제목" not in inbound.columns:
+        inbound["전표제목"] = ""
+
+    if "공급처 상품명" not in inbound.columns:
+        inbound["공급처 상품명"] = ""
+
+    inbound["전표제목"] = (
+        inbound["전표제목"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    inbound["공급처 상품명"] = (
+        inbound["공급처 상품명"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    inbound["불량타입"] = "기타"
+
+    # ========================================================
+    # 불량
+    # ========================================================
+
+    try:
+
+        defect_raw = pd.read_excel(
+            source,
+            sheet_name="불량",
+        )
+
+    except Exception as e:
+
+        raise ValueError(
+            f"'불량' 시트를 읽을 수 없습니다: {e}"
+        )
+
+    missing = [
+        c
+        for c in REQUIRED_DEFECT_COLUMNS
+        if c not in defect_raw.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            f"'불량' 시트에 필수 컬럼이 없습니다: {missing}"
+        )
+
+    defect = defect_raw.copy()
+
+    defect["작업일"] = pd.to_datetime(
+        defect["작업일"],
+        errors="coerce",
+    )
+
+    defect["수량"] = numeric_series(
+        defect["수량"]
+    )
+
+    defect["상품코드"] = normalize_code(
+        defect["상품코드"]
+    )
+
+    defect["상품명"] = (
+        defect["상품명"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    defect["출입구분"] = "불량"
+
+    if "전표제목" not in defect.columns:
+        defect["전표제목"] = ""
+
+    if "공급처 상품명" not in defect.columns:
+        defect["공급처 상품명"] = ""
+
+    defect["전표제목"] = (
+        defect["전표제목"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    defect["공급처 상품명"] = (
+        defect["공급처 상품명"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    defect["불량타입"] = defect[
+        "전표제목"
+    ].apply(
+        classify_defect_type
+    )
+
+    # ========================================================
+    # 출고
+    # ========================================================
+
+    try:
+
+        outbound_raw = pd.read_excel(
+            source,
+            sheet_name="출고",
+        )
+
+    except Exception as e:
+
         raise ValueError(
             f"'출고' 시트를 읽을 수 없습니다: {e}"
         )
 
-    missing_out = [
+    missing = [
         c
         for c in REQUIRED_OUTBOUND_COLUMNS
-        if c not in outbound.columns
+        if c not in outbound_raw.columns
     ]
 
-    if missing_out:
+    if missing:
+
         raise ValueError(
-            f"'출고' 시트에 필수 컬럼이 없습니다: {missing_out}"
+            f"'출고' 시트에 필수 컬럼이 없습니다: {missing}"
         )
 
-    outbound = outbound.copy()
+    outbound = outbound_raw.copy()
 
-    # ★ 핵심 수정
-    # 작업일이 있으면 작업일을 사용하고,
-    # 없을 때만 출고일을 사용한다.
-    outbound["작업일"] = (
-        resolve_outbound_work_date(
-            outbound
+    # --------------------------------------------------------
+    # 출고 날짜 핵심 수정
+    #
+    # 기존:
+    #   출고일을 무조건 작업일로 사용
+    #
+    # 수정:
+    #   작업일이 존재하면 작업일 사용
+    #   작업일이 없으면 출고일 사용
+    # --------------------------------------------------------
+
+    if "작업일" in outbound.columns:
+
+        outbound["작업일"] = pd.to_datetime(
+            outbound["작업일"],
+            errors="coerce",
         )
+
+    else:
+
+        if "출고일" not in outbound.columns:
+
+            raise ValueError(
+                "'출고' 시트에 '작업일' 또는 '출고일'이 필요합니다."
+            )
+
+        outbound["작업일"] = pd.to_datetime(
+            outbound["출고일"],
+            errors="coerce",
+        )
+
+    # 원본 출고수량 그대로 사용
+    outbound["출고수량"] = numeric_series(
+        outbound["출고수량"]
     )
-
-    outbound["출고수량"] = pd.to_numeric(
-        outbound["출고수량"],
-        errors="coerce",
-    ).fillna(0)
 
     outbound["상품코드"] = normalize_code(
         outbound["상품코드"]
     )
 
-    outbound["출입구분"] = "출고"
-
-    outbound["수량"] = (
-        outbound["출고수량"]
+    outbound["상품명"] = (
+        outbound["상품명"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
     )
 
-    for col in [
-        "상품명",
-        "공급처",
-        "공급처 상품명",
-        "전표제목",
-    ]:
+    outbound["출입구분"] = "출고"
 
-        if col in outbound.columns:
+    outbound["수량"] = outbound[
+        "출고수량"
+    ]
 
-            outbound[col] = (
-                outbound[col]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-            )
+    outbound["불량타입"] = "기타"
+
+    if "전표제목" not in outbound.columns:
+        outbound["전표제목"] = ""
+
+    if "공급처 상품명" not in outbound.columns:
+        outbound["공급처 상품명"] = ""
+
+    outbound["전표제목"] = (
+        outbound["전표제목"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    outbound["공급처 상품명"] = (
+        outbound["공급처 상품명"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    # ========================================================
+    # 중요:
+    # 원본 수량을 먼저 계산
+    #
+    # 상품마스터 연결 전이므로
+    # master merge에 의해 수량이 절대 변하지 않음
+    # ========================================================
+
+    raw_totals = {
+        "입고": float(
+            inbound["수량"].sum()
+        ),
+        "출고": float(
+            outbound["출고수량"].sum()
+        ),
+        "불량": float(
+            defect["수량"].sum()
+        ),
+    }
+
+    raw_rows = {
+        "입고": len(inbound),
+        "출고": len(outbound),
+        "불량": len(defect),
+    }
+
+    # ========================================================
+    # 마스터 연결
+    # ========================================================
+
+    inbound = attach_master(
+        inbound,
+        master,
+    )
 
     outbound = attach_master(
         outbound,
         master,
     )
 
-    outbound["불량타입"] = "기타"
-
-    frames.append(
-        outbound
+    defect = attach_master(
+        defect,
+        master,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
+    # 마스터 연결 후 수량 불변 확인
+    # ========================================================
+
+    processed_totals = {
+        "입고": float(
+            inbound["수량"].sum()
+        ),
+        "출고": float(
+            outbound["수량"].sum()
+        ),
+        "불량": float(
+            defect["수량"].sum()
+        ),
+    }
+
+    for kind in DATA_TYPES_ORDER:
+
+        if abs(
+            raw_totals[kind]
+            - processed_totals[kind]
+        ) > 0.000001:
+
+            raise ValueError(
+                f"{kind} 원본 수량과 처리 후 수량이 "
+                f"달라졌습니다. "
+                f"원본={raw_totals[kind]:,.0f}, "
+                f"처리후={processed_totals[kind]:,.0f}"
+            )
+
+    # ========================================================
+    # 거래 데이터 통합
+    # ========================================================
+
+    transaction_frames = [
+        inbound,
+        outbound,
+        defect,
+    ]
+
+    df = pd.concat(
+        transaction_frames,
+        ignore_index=True,
+        sort=False,
+    )
+
+    # 날짜 없는 행은 월별 집계에서는 제외
+    # 수량 원본 자체는 이미 위에서 확정했음
+    df = df[
+        df["작업일"].notna()
+    ].copy()
+
+    df["년월"] = (
+        df["작업일"]
+        .dt.to_period("M")
+        .astype(str)
+    )
+
+    # ========================================================
     # 기초재고
-    # --------------------------------------------------------
+    # ========================================================
 
     try:
-        base = read_sheet(
+
+        base_raw = pd.read_excel(
             source,
-            "기초재고",
+            sheet_name="기초재고",
         )
 
     except Exception as e:
+
         raise ValueError(
             f"'기초재고' 시트를 읽을 수 없습니다: {e}"
         )
 
-    missing_base = [
+    missing = [
         c
         for c in REQUIRED_BASE_COLUMNS
-        if c not in base.columns
+        if c not in base_raw.columns
     ]
 
-    if missing_base:
+    if missing:
+
         raise ValueError(
-            f"'기초재고' 시트에 필수 컬럼이 없습니다: {missing_base}"
+            f"'기초재고' 시트에 필수 컬럼이 없습니다: {missing}"
         )
 
-    base = base.copy()
+    base = base_raw.copy()
 
     base["기준일"] = pd.to_datetime(
         base["기준일"],
@@ -807,75 +913,109 @@ def load_and_process(
         .str.strip()
     )
 
-    base["현재고수량"] = pd.to_numeric(
-        base["현재고수량"],
-        errors="coerce",
-    ).fillna(0)
+    base["현재고수량"] = numeric_series(
+        base["현재고수량"]
+    )
 
-    base = base.dropna(
-        subset=["기준일"]
-    ).copy()
+    base = base[
+        base["기준일"].notna()
+    ].copy()
 
+    # 기초재고도 master map 방식으로 연결
     base = attach_master(
         base,
         master,
     )
 
-    # --------------------------------------------------------
-    # 전체 거래 데이터 통합
-    # --------------------------------------------------------
+    # ========================================================
+    # 기초재고 기준일
+    #
+    # 2026-01-01이 있으면 그것을 사용
+    # 없으면 2026-01-01 이전 가장 최근 기준일 사용
+    # ========================================================
 
-    df = pd.concat(
-        frames,
-        ignore_index=True,
-        sort=False,
-    )
+    exact_base = base[
+        base["기준일"].eq(BASE_DATE)
+    ].copy()
 
-    # 작업일이 없는 거래는 월별 계산에서 제외
-    df = df.dropna(
-        subset=["작업일"]
-    ).copy()
+    if not exact_base.empty:
 
-    # ★ 모든 월별 계산은 이 컬럼 하나만 사용
-    df["년월"] = (
-        df["작업일"]
-        .dt.to_period("M")
-        .astype(str)
-    )
+        base_selected = exact_base.copy()
 
-    for col in [
-        "상품명",
-        "상품코드",
-        "공급처",
-        "공급처 상품명",
-        "전표제목",
-        "공장",
-        "카테고리",
-    ]:
+    else:
 
-        if col in df.columns:
+        before_base = base[
+            base["기준일"].le(BASE_DATE)
+        ].copy()
 
-            df[col] = (
-                df[col]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-            )
+        if not before_base.empty:
+
+            latest_date = before_base[
+                "기준일"
+            ].max()
+
+            base_selected = before_base[
+                before_base["기준일"].eq(
+                    latest_date
+                )
+            ].copy()
+
+        else:
+
+            base_selected = base.copy()
+
+    # ========================================================
+    # 내부 데이터 무결성 정보
+    # ========================================================
+
+    validation = {
+        "raw_totals": raw_totals,
+        "processed_totals": processed_totals,
+        "raw_rows": raw_rows,
+        "master_rows": len(master_raw),
+        "master_unique_skus": master[
+            "상품코드"
+        ].nunique(),
+        "base_qty": float(
+            base_selected[
+                "현재고수량"
+            ].sum()
+        ),
+        "base_date": (
+            base_selected["기준일"]
+            .iloc[0]
+            .strftime("%Y-%m-%d")
+            if not base_selected.empty
+            else ""
+        ),
+        "negative_rows": {
+            "입고": int(
+                (inbound["수량"] < 0).sum()
+            ),
+            "출고": int(
+                (outbound["수량"] < 0).sum()
+            ),
+            "불량": int(
+                (defect["수량"] < 0).sum()
+            ),
+        },
+    }
 
     return (
         df,
-        base,
+        base_selected,
         master,
+        validation,
     )
 
 
 # ============================================================
-# 불량률
+# 안전한 비율 계산
 # ============================================================
 
 def safe_rate(
-    numerator: float,
-    denominator: float,
+    numerator,
+    denominator,
 ) -> float:
 
     if denominator == 0:
@@ -884,15 +1024,15 @@ def safe_rate(
     return (
         float(numerator)
         / float(denominator)
-        * 100.0
+        * 100
     )
 
 
 # ============================================================
-# 필터
+# 거래 필터
 # ============================================================
 
-def filter_data(
+def filter_transactions(
     df: pd.DataFrame,
     selected_factories: List[str],
     selected_categories: List[str],
@@ -908,17 +1048,21 @@ def filter_data(
         df["공장"].isin(
             selected_factories
         )
-        & df["카테고리"].isin(
+        &
+        df["카테고리"].isin(
             selected_categories
         )
-        & df["출입구분"].isin(
+        &
+        df["출입구분"].isin(
             selected_kinds
         )
-        & (
+        &
+        (
             df["작업일"].dt.date
             >= start_date
         )
-        & (
+        &
+        (
             df["작업일"].dt.date
             <= end_date
         )
@@ -928,7 +1072,7 @@ def filter_data(
         mask
     ].copy()
 
-    # 불량타입 필터는 불량 데이터에만 적용
+    # 불량타입은 불량 데이터에만 적용
     if not result.empty:
 
         defect_mask = (
@@ -944,6 +1088,7 @@ def filter_data(
             )
         ].copy()
 
+    # 상품명 검색
     if product_name_query:
 
         result = result[
@@ -955,6 +1100,7 @@ def filter_data(
             )
         ].copy()
 
+    # 상품코드 검색
     if product_code_query:
 
         result = result[
@@ -973,19 +1119,20 @@ def filter_data(
 # 기초재고 필터
 # ============================================================
 
-def filtered_base_stock(
+def filter_base(
     base: pd.DataFrame,
     selected_factories: List[str],
     selected_categories: List[str],
-    product_name_query: str = "",
-    product_code_query: str = "",
+    product_name_query: str,
+    product_code_query: str,
 ) -> pd.DataFrame:
 
     result = base[
         base["공장"].isin(
             selected_factories
         )
-        & base["카테고리"].isin(
+        &
+        base["카테고리"].isin(
             selected_categories
         )
     ].copy()
@@ -999,7 +1146,7 @@ def filtered_base_stock(
                 na=False,
                 regex=False,
             )
-        ]
+        ].copy()
 
     if product_code_query:
 
@@ -1010,31 +1157,27 @@ def filtered_base_stock(
                 na=False,
                 regex=False,
             )
-        ]
+        ].copy()
 
     return result
 
 
 # ============================================================
-# 월별 재고 계산
+# 월별 집계
 # ============================================================
 
-def monthly_inventory_summary(
+def make_monthly_summary(
     filtered: pd.DataFrame,
     base: pd.DataFrame,
-    selected_factories: List[str],
-    selected_categories: List[str],
-    product_name_query: str,
-    product_code_query: str,
 ) -> pd.DataFrame:
 
     columns = [
         "년월",
         "기초재고",
-        "월초이론재고",
         "입고",
         "출고",
         "불량",
+        "월초이론재고",
         "당월입고후재고",
         "월말이론재고",
         "실제검수수량",
@@ -1053,65 +1196,43 @@ def monthly_inventory_summary(
         )
 
     # --------------------------------------------------------
-    # 기초재고
-    # --------------------------------------------------------
-
-    base_sub = filtered_base_stock(
-        base,
-        selected_factories,
-        selected_categories,
-        product_name_query,
-        product_code_query,
-    )
-
-    base_qty = float(
-        base_sub["현재고수량"].sum()
-    )
-
-    # --------------------------------------------------------
-    # ★ 핵심
-    # 월별 데이터는 작업일 기준으로 직접 집계
+    # 월별 수량
     # --------------------------------------------------------
 
     monthly = (
         filtered
         .groupby(
-            [
-                "년월",
-                "출입구분",
-            ],
-            sort=True,
+            ["년월", "출입구분"],
+            dropna=False,
         )["수량"]
         .sum()
         .unstack(
             fill_value=0
         )
-    )
-
-    # 입고 / 출고 / 불량 컬럼 강제
-    for col in DATA_TYPES_ORDER:
-
-        if col not in monthly.columns:
-            monthly[col] = 0.0
-
-    monthly = (
-        monthly[
-            DATA_TYPES_ORDER
-        ]
-        .fillna(0)
         .sort_index()
     )
+
+    for kind in DATA_TYPES_ORDER:
+
+        if kind not in monthly.columns:
+            monthly[kind] = 0.0
+
+    monthly = monthly[
+        DATA_TYPES_ORDER
+    ].copy()
 
     # --------------------------------------------------------
     # 기초재고
     # --------------------------------------------------------
 
-    monthly["기초재고"] = (
-        base_qty
+    base_qty = float(
+        base["현재고수량"].sum()
     )
 
+    monthly["기초재고"] = base_qty
+
     # --------------------------------------------------------
-    # 월별 합계 → 누계
+    # 누계
     # --------------------------------------------------------
 
     monthly["누적입고"] = (
@@ -1130,37 +1251,32 @@ def monthly_inventory_summary(
     )
 
     # --------------------------------------------------------
-    # 월초 재고
+    # 이론재고
     # --------------------------------------------------------
 
     monthly["월초이론재고"] = (
         base_qty
-        + monthly["누적입고"].shift(
-            1,
-            fill_value=0,
-        )
-        - monthly["누적출고"].shift(
-            1,
-            fill_value=0,
-        )
-        - monthly["누적불량"].shift(
-            1,
-            fill_value=0,
-        )
+        + monthly["누적입고"]
+            .shift(
+                1,
+                fill_value=0,
+            )
+        - monthly["누적출고"]
+            .shift(
+                1,
+                fill_value=0,
+            )
+        - monthly["누적불량"]
+            .shift(
+                1,
+                fill_value=0,
+            )
     )
-
-    # --------------------------------------------------------
-    # 당월 입고 후 재고
-    # --------------------------------------------------------
 
     monthly["당월입고후재고"] = (
         monthly["월초이론재고"]
         + monthly["입고"]
     )
-
-    # --------------------------------------------------------
-    # 월말 이론재고
-    # --------------------------------------------------------
 
     monthly["월말이론재고"] = (
         monthly["당월입고후재고"]
@@ -1176,10 +1292,6 @@ def monthly_inventory_summary(
         monthly["출고"]
         + monthly["불량"]
     )
-
-    # --------------------------------------------------------
-    # 월불량률
-    # --------------------------------------------------------
 
     monthly["월불량률"] = (
         monthly["불량"]
@@ -1203,10 +1315,6 @@ def monthly_inventory_summary(
         + monthly["누적불량"]
     )
 
-    # --------------------------------------------------------
-    # 누계 불량률
-    # --------------------------------------------------------
-
     monthly["누계불량률"] = (
         monthly["누적불량"]
         .div(
@@ -1222,17 +1330,16 @@ def monthly_inventory_summary(
 
     monthly.index.name = "년월"
 
-    return (
-        monthly
-        .reset_index()
-    )
+    result = monthly.reset_index()
+
+    return result
 
 
 # ============================================================
 # SKU 요약
 # ============================================================
 
-def build_sku_summary(
+def make_sku_summary(
     filtered: pd.DataFrame,
     base: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -1240,7 +1347,7 @@ def build_sku_summary(
     if filtered.empty:
         return pd.DataFrame()
 
-    sku_set = sorted(
+    sku_codes = sorted(
         set(
             filtered["상품코드"]
             .astype(str)
@@ -1248,21 +1355,55 @@ def build_sku_summary(
         - {""}
     )
 
-    if not sku_set:
+    if not sku_codes:
         return pd.DataFrame()
 
-    sku = pd.DataFrame(
+    result = pd.DataFrame(
         {
-            "상품코드": sku_set
+            "상품코드": sku_codes
         }
     )
 
+    # --------------------------------------------------------
+    # 상품 기본정보
+    # --------------------------------------------------------
+
+    info = (
+        filtered
+        .groupby(
+            "상품코드",
+            as_index=False,
+        )
+        .agg(
+            상품명=(
+                "상품명",
+                "first",
+            ),
+            공장=(
+                "공장",
+                "first",
+            ),
+            카테고리=(
+                "카테고리",
+                "first",
+            ),
+        )
+    )
+
+    result = result.merge(
+        info,
+        on="상품코드",
+        how="left",
+    )
+
+    # --------------------------------------------------------
     # 기초재고
-    b = (
+    # --------------------------------------------------------
+
+    base_sku = (
         base[
-            base["상품코드"].isin(
-                sku_set
-            )
+            base["상품코드"]
+            .isin(sku_codes)
         ]
         .groupby(
             "상품코드",
@@ -1276,10 +1417,20 @@ def build_sku_summary(
         )
     )
 
+    result = result.merge(
+        base_sku,
+        on="상품코드",
+        how="left",
+    )
+
+    # --------------------------------------------------------
     # 입고
-    i = (
+    # --------------------------------------------------------
+
+    inbound = (
         filtered[
-            filtered["출입구분"] == "입고"
+            filtered["출입구분"]
+            .eq("입고")
         ]
         .groupby(
             "상품코드",
@@ -1293,10 +1444,20 @@ def build_sku_summary(
         )
     )
 
+    result = result.merge(
+        inbound,
+        on="상품코드",
+        how="left",
+    )
+
+    # --------------------------------------------------------
     # 출고
-    o = (
+    # --------------------------------------------------------
+
+    outbound = (
         filtered[
-            filtered["출입구분"] == "출고"
+            filtered["출입구분"]
+            .eq("출고")
         ]
         .groupby(
             "상품코드",
@@ -1310,10 +1471,20 @@ def build_sku_summary(
         )
     )
 
+    result = result.merge(
+        outbound,
+        on="상품코드",
+        how="left",
+    )
+
+    # --------------------------------------------------------
     # 불량
-    d = (
+    # --------------------------------------------------------
+
+    defect = (
         filtered[
-            filtered["출입구분"] == "불량"
+            filtered["출입구분"]
+            .eq("불량")
         ]
         .groupby(
             "상품코드",
@@ -1327,38 +1498,11 @@ def build_sku_summary(
         )
     )
 
-    # 상품정보
-    info = (
-        filtered
-        .groupby(
-            "상품코드",
-            as_index=False,
-        )
-        .agg(
-            상품명=("상품명", "first"),
-            공장=("공장", "first"),
-            카테고리=("카테고리", "first"),
-        )
-    )
-
-    result = sku.merge(
-        info,
+    result = result.merge(
+        defect,
         on="상품코드",
         how="left",
     )
-
-    for part in [
-        b,
-        i,
-        o,
-        d,
-    ]:
-
-        result = result.merge(
-            part,
-            on="상품코드",
-            how="left",
-        )
 
     for col in [
         "기초재고",
@@ -1367,18 +1511,27 @@ def build_sku_summary(
         "불량수량",
     ]:
 
+        if col not in result.columns:
+            result[col] = 0.0
+
         result[col] = (
             result[col]
             .fillna(0)
         )
 
+    # --------------------------------------------------------
     # 실제 검수
+    # --------------------------------------------------------
+
     result["실제검수수량"] = (
         result["출고수량"]
         + result["불량수량"]
     )
 
-    # 불량률
+    # --------------------------------------------------------
+    # 검수 기준 불량률
+    # --------------------------------------------------------
+
     result["불량률"] = (
         result["불량수량"]
         .div(
@@ -1392,7 +1545,10 @@ def build_sku_summary(
         * 100
     ).fillna(0)
 
-    # 기말 이론재고
+    # --------------------------------------------------------
+    # 이론재고
+    # --------------------------------------------------------
+
     result["기말이론재고"] = (
         result["기초재고"]
         + result["입고수량"]
@@ -1400,86 +1556,20 @@ def build_sku_summary(
         - result["불량수량"]
     )
 
-    # 재고흐름
-    result["재고흐름"] = (
-        result["기말이론재고"]
-        .apply(
-            lambda x:
-                "점검필요(음수)"
-                if x < 0
-                else "정상"
-        )
-    )
-
-    # 검수 여부
-    result["검수여부"] = (
-        result["실제검수수량"]
-        .apply(
-            lambda x:
-                "검수 발생"
-                if x > 0
-                else "미검수"
-        )
-    )
-
     return result
-
-
-# ============================================================
-# 재고 흐름 검증
-# ============================================================
-
-def stock_flow_validation(
-    filtered: pd.DataFrame,
-    base: pd.DataFrame,
-) -> pd.DataFrame:
-
-    result = build_sku_summary(
-        filtered,
-        base,
-    )
-
-    if result.empty:
-        return result
-
-    result = result.sort_values(
-        [
-            "재고흐름",
-            "기말이론재고",
-        ],
-        ascending=[
-            True,
-            True,
-        ],
-        key=lambda s:
-            s.map(
-                {
-                    "점검필요(음수)": 0,
-                    "정상": 1,
-                }
-            )
-            if s.name == "재고흐름"
-            else s,
-    )
-
-    return result.reset_index(
-        drop=True
-    )
 
 
 # ============================================================
 # 라인차트
 # ============================================================
 
-def line_chart(
+def make_line_chart(
     x,
     y,
     name,
     title,
     y_title,
     suffix="",
-    color_light="#1565C0",
-    color_dark="#64B5F6",
 ):
 
     dark = (
@@ -1487,11 +1577,13 @@ def line_chart(
         == "dark"
     )
 
-    color = (
-        color_dark
-        if dark
-        else color_light
-    )
+    if dark:
+
+        line_color = "#64B5F6"
+
+    else:
+
+        line_color = "#1565C0"
 
     fig = go.Figure()
 
@@ -1505,13 +1597,14 @@ def line_chart(
                 (
                     f"{v:,.2f}{suffix}"
                     if suffix
-                    else f"{v:,.0f}"
+                    else
+                    f"{v:,.0f}"
                 )
                 for v in y
             ],
             textposition="top center",
             line=dict(
-                color=color,
+                color=line_color,
                 width=4,
             ),
             marker=dict(
@@ -1538,6 +1631,37 @@ def line_chart(
 
 
 # ============================================================
+# 데이터프레임 출력
+# ============================================================
+
+def show_table(
+    df: pd.DataFrame,
+    height=None,
+):
+
+    if df is None or df.empty:
+
+        st.info(
+            "표시할 데이터가 없습니다."
+        )
+
+        return
+
+    kwargs = {
+        "use_container_width": True,
+        "hide_index": True,
+    }
+
+    if height is not None:
+        kwargs["height"] = height
+
+    st.dataframe(
+        df,
+        **kwargs,
+    )
+
+
+# ============================================================
 # 화면
 # ============================================================
 
@@ -1546,13 +1670,13 @@ st.title(
 )
 
 st.caption(
-    "월별 입고·출고·불량은 모두 통합된 '작업일' 기준으로 계산합니다. "
-    "불량률은 실제 검수수량(출고+불량)을 기준으로 계산합니다."
+    "입고·출고·불량은 원본 거래 수량을 그대로 집계하며, "
+    "검수 기준 불량률은 불량 ÷ (출고 + 불량)으로 계산합니다."
 )
 
 
 # ============================================================
-# 파일 선택
+# 파일
 # ============================================================
 
 data_source = (
@@ -1564,14 +1688,14 @@ data_source = (
 )
 
 uploaded = st.file_uploader(
-    "raw_data.xlsx 업로드 (선택)",
+    "raw_data.xlsx 업로드",
     type=["xlsx"],
-    help="업로드하면 업로드한 파일을 사용합니다.",
+    help=(
+        "업로드하면 업로드한 엑셀 파일을 사용합니다."
+    ),
 )
 
 if uploaded is not None:
-
-    data_source = None
 
     file_bytes = (
         uploaded.getvalue()
@@ -1597,30 +1721,24 @@ else:
 
 
 # ============================================================
-# 데이터 로드
+# 데이터 처리
 # ============================================================
 
 try:
 
-    df, base, master = (
-        load_and_process(
-            file_bytes
-        )
+    (
+        df,
+        base,
+        master,
+        validation,
+    ) = load_data(
+        file_bytes
     )
 
 except Exception as e:
 
     st.error(
         f"데이터를 읽는 중 오류가 발생했습니다: {e}"
-    )
-
-    st.stop()
-
-
-if df.empty:
-
-    st.warning(
-        "작업일이 정상적으로 입력된 거래 데이터가 없습니다."
     )
 
     st.stop()
@@ -1634,99 +1752,88 @@ st.subheader(
     "🔎 필터"
 )
 
-filter1, filter2, filter3, filter4 = (
-    st.columns(4)
-)
-
+filter1, filter2, filter3, filter4 = st.columns(4)
 
 factory_options = [
     x
     for x in FACTORIES
-    if x in set(df["공장"])
+    if x in set(
+        df["공장"].dropna()
+    )
 ]
 
 category_options = [
     x
     for x in CATEGORIES
-    if x in set(df["카테고리"])
+    if x in set(
+        df["카테고리"].dropna()
+    )
 ]
 
 defect_type_options = [
     x
     for x in DEFECT_TYPES_ORDER
-    if x in set(df["불량타입"])
+    if x in set(
+        df["불량타입"].dropna()
+    )
 ]
 
 
 with filter1:
 
-    selected_factories = (
-        st.multiselect(
-            "🏭 공장",
-            options=factory_options,
-            default=factory_options,
-        )
+    selected_factories = st.multiselect(
+        "🏭 공장",
+        options=factory_options,
+        default=factory_options,
     )
 
 
 with filter2:
 
-    selected_categories = (
-        st.multiselect(
-            "👓 카테고리",
-            options=category_options,
-            default=category_options,
-            help="G=안경 / S=선글라스",
-        )
+    selected_categories = st.multiselect(
+        "👓 카테고리",
+        options=category_options,
+        default=category_options,
+        help="G = 안경 / S = 선글라스",
     )
 
 
 with filter3:
 
-    selected_defect_types = (
-        st.multiselect(
-            "🏷️ 불량타입",
-            options=defect_type_options,
-            default=defect_type_options,
-        )
+    selected_defect_types = st.multiselect(
+        "🏷️ 불량타입",
+        options=defect_type_options,
+        default=defect_type_options,
     )
 
 
 with filter4:
 
-    selected_kinds = (
-        st.multiselect(
-            "📂 데이터 종류",
-            options=DATA_TYPES_ORDER,
-            default=DATA_TYPES_ORDER,
-        )
+    selected_kinds = st.multiselect(
+        "📂 데이터 종류",
+        options=DATA_TYPES_ORDER,
+        default=DATA_TYPES_ORDER,
     )
 
 
-filter5, filter6, filter7 = (
-    st.columns(
-        [1.4, 1.4, 1]
-    )
+filter5, filter6, filter7 = st.columns(
+    [1.4, 1.4, 1]
 )
 
 
 with filter5:
 
-    product_name_query = (
-        st.text_input(
-            "상품명 검색",
-            placeholder="상품명",
-        )
+    product_name_query = st.text_input(
+        "상품명 검색",
+        placeholder="상품명",
     )
 
 
 with filter6:
 
-    product_code_query = (
-        st.text_input(
-            "상품코드 검색",
-            placeholder="상품코드",
-        )
+    product_code_query = st.text_input(
+        "상품코드 검색",
+        placeholder="상품코드",
     )
 
 
@@ -1745,7 +1852,7 @@ with filter7:
     )
 
     date_range = st.date_input(
-        "작업일 범위",
+        "거래일 범위",
         value=(
             min_date,
             max_date,
@@ -1756,7 +1863,7 @@ with filter7:
 
 
 # ============================================================
-# 필터 검증
+# 필터 예외 처리
 # ============================================================
 
 if not selected_factories:
@@ -1792,7 +1899,8 @@ if (
 ):
 
     st.warning(
-        "불량 데이터를 보려면 불량타입을 하나 이상 선택해주세요."
+        "불량 데이터를 보려면 "
+        "불량타입을 하나 이상 선택해주세요."
     )
 
     st.stop()
@@ -1806,9 +1914,8 @@ if (
     and len(date_range) == 2
 ):
 
-    start_date, end_date = (
-        date_range
-    )
+    start_date = date_range[0]
+    end_date = date_range[1]
 
 else:
 
@@ -1820,7 +1927,7 @@ else:
 # 필터 적용
 # ============================================================
 
-filtered = filter_data(
+filtered = filter_transactions(
     df=df,
     selected_factories=selected_factories,
     selected_categories=selected_categories,
@@ -1843,54 +1950,58 @@ if filtered.empty:
 
 
 # ============================================================
+# 기초재고 필터
+# ============================================================
+
+base_filtered = filter_base(
+    base=base,
+    selected_factories=selected_factories,
+    selected_categories=selected_categories,
+    product_name_query=product_name_query,
+    product_code_query=product_code_query,
+)
+
+
+# ============================================================
 # KPI
 # ============================================================
 
-total_in = filtered.loc[
-    filtered["출입구분"] == "입고",
-    "수량",
-].sum()
-
-total_out = filtered.loc[
-    filtered["출입구분"] == "출고",
-    "수량",
-].sum()
-
-total_defect = filtered.loc[
-    filtered["출입구분"] == "불량",
-    "수량",
-].sum()
-
-
-base_filtered = (
-    filtered_base_stock(
-        base,
-        selected_factories,
-        selected_categories,
-        product_name_query,
-        product_code_query,
-    )
+total_in = float(
+    filtered.loc[
+        filtered["출입구분"].eq("입고"),
+        "수량",
+    ].sum()
 )
 
-total_base = (
+total_out = float(
+    filtered.loc[
+        filtered["출입구분"].eq("출고"),
+        "수량",
+    ].sum()
+)
+
+total_defect = float(
+    filtered.loc[
+        filtered["출입구분"].eq("불량"),
+        "수량",
+    ].sum()
+)
+
+total_base = float(
     base_filtered[
         "현재고수량"
     ].sum()
 )
-
 
 inspection_total = (
     total_out
     + total_defect
 )
 
-overall_defect_rate = (
-    safe_rate(
-        total_defect,
-        inspection_total,
-    )
+overall_defect_rate = safe_rate(
+    total_defect,
+    inspection_total,
 )
-
 
 ending_theoretical = (
     total_base
@@ -1900,9 +2011,7 @@ ending_theoretical = (
 )
 
 
-k1, k2, k3, k4, k5, k6, k7 = (
-    st.columns(7)
-)
+k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 
 
 k1.metric(
@@ -1941,39 +2050,30 @@ k7.metric(
 )
 
 
-if ending_theoretical < 0:
+if inspection_total > 0:
 
-    st.warning(
-        "선택 조건에서 기초재고 + 입고 - 출고 - 불량이 음수입니다."
+    st.info(
+        f"실제 검수수량 = "
+        f"출고 {total_out:,.0f} + "
+        f"불량 {total_defect:,.0f} = "
+        f"{inspection_total:,.0f} / "
+        f"검수 기준 불량률 = "
+        f"{total_defect:,.0f} ÷ "
+        f"{inspection_total:,.0f} = "
+        f"{overall_defect_rate:.2f}%"
     )
-
-
-st.info(
-    f"검수 기준: 실제 검수수량 = 출고 {total_out:,.0f} + "
-    f"불량 {total_defect:,.0f} = {inspection_total:,.0f} / "
-    f"불량률 = {total_defect:,.0f} ÷ "
-    f"{inspection_total:,.0f} = "
-    f"{overall_defect_rate:.2f}%"
-    if inspection_total > 0
-    else
-    "현재 선택 조건에는 실제 검수수량(출고+불량)이 없습니다."
-)
 
 
 st.divider()
 
 
 # ============================================================
-# 월별 계산
+# 월별 집계
 # ============================================================
 
-monthly = monthly_inventory_summary(
+monthly = make_monthly_summary(
     filtered=filtered,
-    base=base,
-    selected_factories=selected_factories,
-    selected_categories=selected_categories,
-    product_name_query=product_name_query,
-    product_code_query=product_code_query,
+    base=base_filtered,
 )
 
 
@@ -1982,33 +2082,24 @@ monthly = monthly_inventory_summary(
 # ============================================================
 
 st.subheader(
-    "📊 월별 재고 흐름 / 실제 검수 불량률"
+    "📊 월별 입고 · 출고 · 불량"
 )
-
 
 dark = (
     get_theme_type()
     == "dark"
 )
 
-
 fig_month = go.Figure()
 
-
-# ------------------------------------------------------------
-# 입고
-# ------------------------------------------------------------
 
 fig_month.add_trace(
     go.Bar(
         x=monthly["년월"],
         y=monthly["입고"],
         name="입고",
-        text=monthly[
-            "입고"
-        ].map(
-            lambda x:
-                f"{x:,.0f}"
+        text=monthly["입고"].map(
+            lambda x: f"{x:,.0f}"
         ),
         textposition="outside",
         marker_color=(
@@ -2021,20 +2112,13 @@ fig_month.add_trace(
 )
 
 
-# ------------------------------------------------------------
-# 출고
-# ------------------------------------------------------------
-
 fig_month.add_trace(
     go.Bar(
         x=monthly["년월"],
         y=monthly["출고"],
         name="출고",
-        text=monthly[
-            "출고"
-        ].map(
-            lambda x:
-                f"{x:,.0f}"
+        text=monthly["출고"].map(
+            lambda x: f"{x:,.0f}"
         ),
         textposition="outside",
         marker_color=(
@@ -2047,20 +2131,13 @@ fig_month.add_trace(
 )
 
 
-# ------------------------------------------------------------
-# 불량
-# ------------------------------------------------------------
-
 fig_month.add_trace(
     go.Bar(
         x=monthly["년월"],
         y=monthly["불량"],
         name="불량",
-        text=monthly[
-            "불량"
-        ].map(
-            lambda x:
-                f"{x:,.0f}"
+        text=monthly["불량"].map(
+            lambda x: f"{x:,.0f}"
         ),
         textposition="outside",
         marker_color=(
@@ -2073,10 +2150,6 @@ fig_month.add_trace(
 )
 
 
-# ------------------------------------------------------------
-# 월불량률
-# ------------------------------------------------------------
-
 fig_month.add_trace(
     go.Scatter(
         x=monthly["년월"],
@@ -2086,8 +2159,7 @@ fig_month.add_trace(
         text=monthly[
             "월불량률"
         ].map(
-            lambda x:
-                f"{x:.2f}%"
+            lambda x: f"{x:.2f}%"
         ),
         textposition="top center",
         line=dict(
@@ -2114,7 +2186,7 @@ fig_month = apply_theme(
 
 fig_month.update_layout(
     barmode="group",
-    xaxis_title="작업일 기준 년월",
+    xaxis_title="년월",
     yaxis=dict(
         title="수량",
         separatethousands=True,
@@ -2137,25 +2209,20 @@ st.plotly_chart(
 
 
 st.caption(
-    "월별 입고 / 출고 / 불량은 모두 '작업일'의 월을 기준으로 합산합니다. "
-    "월불량률 = 당월 불량 ÷ (당월 출고 + 당월 불량)"
+    "월별 수량은 각 원본 시트의 실제 수량을 그대로 합산합니다. "
+    "검수 기준 월불량률 = 당월 불량 ÷ (당월 출고 + 당월 불량)"
 )
 
 
 # ============================================================
-# ★ 월별 계산 검증표
+# 월별 계산표
 # ============================================================
 
 st.subheader(
-    "📋 월별 계산 확인"
+    "📋 월별 수량 / 누계"
 )
 
-st.caption(
-    "이 표의 입고·출고·불량 값은 원본 거래를 '작업일 → 년월'로 직접 묶어서 합산한 값입니다."
-)
-
-
-show_month = monthly[
+monthly_display = monthly[
     [
         "년월",
         "기초재고",
@@ -2176,24 +2243,8 @@ show_month = monthly[
 ].copy()
 
 
-show_dataframe(
-    show_month,
-    format_dict={
-        "기초재고": "{:,.0f}",
-        "월초이론재고": "{:,.0f}",
-        "입고": "{:,.0f}",
-        "출고": "{:,.0f}",
-        "불량": "{:,.0f}",
-        "당월입고후재고": "{:,.0f}",
-        "월말이론재고": "{:,.0f}",
-        "실제검수수량": "{:,.0f}",
-        "월불량률": "{:.2f}%",
-        "누적입고": "{:,.0f}",
-        "누적출고": "{:,.0f}",
-        "누적불량": "{:,.0f}",
-        "누계검수수량": "{:,.0f}",
-        "누계불량률": "{:.2f}%",
-    },
+show_table(
+    monthly_display
 )
 
 
@@ -2201,37 +2252,32 @@ st.divider()
 
 
 # ============================================================
-# 월별 누계
+# 월별 누계 차트
 # ============================================================
 
 st.subheader(
     "📈 월별 누계"
 )
 
-
-tab1, tab2, tab3, tab4 = (
-    st.tabs(
-        [
-            "누계 입고",
-            "누계 출고",
-            "누계 이론재고",
-            "누계 불량률",
-        ]
-    )
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "누계 입고",
+        "누계 출고",
+        "누계 이론재고",
+        "누계 불량률",
+    ]
 )
 
 
 with tab1:
 
     st.plotly_chart(
-        line_chart(
+        make_line_chart(
             monthly["년월"],
             monthly["누적입고"],
             "누계 입고",
             "누계 입고",
-            "누계 입고 수량",
-            color_light="#1565C0",
-            color_dark="#64B5F6",
+            "수량",
         ),
         use_container_width=True,
     )
@@ -2240,14 +2286,12 @@ with tab1:
 with tab2:
 
     st.plotly_chart(
-        line_chart(
+        make_line_chart(
             monthly["년월"],
             monthly["누적출고"],
             "누계 출고",
             "누계 출고",
-            "누계 출고 수량",
-            color_light="#2E7D32",
-            color_dark="#81C784",
+            "수량",
         ),
         use_container_width=True,
     )
@@ -2256,14 +2300,12 @@ with tab2:
 with tab3:
 
     st.plotly_chart(
-        line_chart(
+        make_line_chart(
             monthly["년월"],
             monthly["월말이론재고"],
             "월말 이론재고",
-            "월말 이론재고",
+            "기초재고 + 누계입고 - 누계출고 - 누계불량",
             "이론재고",
-            color_light="#6A1B9A",
-            color_dark="#CE93D8",
         ),
         use_container_width=True,
     )
@@ -2272,30 +2314,28 @@ with tab3:
 with tab4:
 
     st.plotly_chart(
-        line_chart(
+        make_line_chart(
             monthly["년월"],
             monthly["누계불량률"],
             "누계 검수 기준 불량률",
             "누계 검수 기준 불량률",
             "불량률",
             suffix="%",
-            color_light="#E65100",
-            color_dark="#FFD54F",
         ),
         use_container_width=True,
     )
+
+
+st.divider()
 
 
 # ============================================================
 # 공장별
 # ============================================================
 
-st.divider()
-
 st.subheader(
-    "🏭 공장별 입고 · 출고 · 불량 · 검수"
+    "🏭 공장별 입고 · 출고 · 불량"
 )
-
 
 factory_summary = (
     filtered
@@ -2312,26 +2352,29 @@ factory_summary = (
 )
 
 
-for col in DATA_TYPES_ORDER:
+for kind in DATA_TYPES_ORDER:
 
-    if col not in factory_summary.columns:
-        factory_summary[col] = 0
+    if kind not in factory_summary.columns:
 
-
-factory_summary = (
-    factory_summary[
-        DATA_TYPES_ORDER
-    ]
-)
+        factory_summary[kind] = 0.0
 
 
-factory_summary["실제검수수량"] = (
+factory_summary = factory_summary[
+    DATA_TYPES_ORDER
+].copy()
+
+
+factory_summary[
+    "실제검수수량"
+] = (
     factory_summary["출고"]
     + factory_summary["불량"]
 )
 
 
-factory_summary["불량률"] = (
+factory_summary[
+    "불량률"
+] = (
     factory_summary["불량"]
     .div(
         factory_summary[
@@ -2347,9 +2390,9 @@ factory_summary["불량률"] = (
 
 factory_base = (
     base_filtered
-    .groupby(
-        "공장"
-    )["현재고수량"]
+    .groupby("공장")[
+        "현재고수량"
+    ]
     .sum()
     .reindex(
         factory_summary.index
@@ -2358,23 +2401,18 @@ factory_base = (
 )
 
 
-factory_summary["기초재고"] = (
-    factory_base
-)
+factory_summary[
+    "기초재고"
+] = factory_base
 
 
-factory_summary["이론잔여재고"] = (
+factory_summary[
+    "이론잔여재고"
+] = (
     factory_summary["기초재고"]
     + factory_summary["입고"]
     - factory_summary["출고"]
     - factory_summary["불량"]
-)
-
-
-factory_colors = (
-    FACTORY_COLORS_DARK
-    if dark
-    else FACTORY_COLORS_LIGHT
 )
 
 
@@ -2386,13 +2424,6 @@ fig_factory.add_trace(
         x=factory_summary.index,
         y=factory_summary["입고"],
         name="입고",
-        marker_color=[
-            factory_colors.get(
-                x,
-                factory_colors["미상"],
-            )
-            for x in factory_summary.index
-        ],
     )
 )
 
@@ -2402,11 +2433,6 @@ fig_factory.add_trace(
         x=factory_summary.index,
         y=factory_summary["출고"],
         name="출고",
-        marker_color=(
-            "#66BB6A"
-            if dark
-            else "#2E7D32"
-        ),
     )
 )
 
@@ -2416,11 +2442,6 @@ fig_factory.add_trace(
         x=factory_summary.index,
         y=factory_summary["불량"],
         name="불량",
-        marker_color=(
-            "#EF5350"
-            if dark
-            else "#C62828"
-        ),
     )
 )
 
@@ -2434,19 +2455,10 @@ fig_factory.add_trace(
         text=factory_summary[
             "불량률"
         ].map(
-            lambda x:
-                f"{x:.2f}%"
+            lambda x: f"{x:.2f}%"
         ),
         textposition="top center",
         yaxis="y2",
-        line=dict(
-            color=(
-                "#FFD54F"
-                if dark
-                else "#E65100"
-            ),
-            width=3,
-        ),
     )
 )
 
@@ -2480,17 +2492,10 @@ st.plotly_chart(
 )
 
 
-show_dataframe(
-    factory_summary,
-    format_dict={
-        "기초재고": "{:,.0f}",
-        "입고": "{:,.0f}",
-        "출고": "{:,.0f}",
-        "불량": "{:,.0f}",
-        "실제검수수량": "{:,.0f}",
-        "불량률": "{:.2f}%",
-        "이론잔여재고": "{:,.0f}",
-    },
+factory_display = factory_summary.reset_index()
+
+show_table(
+    factory_display
 )
 
 
@@ -2501,7 +2506,6 @@ show_dataframe(
 st.subheader(
     "👓 카테고리별 G / S"
 )
-
 
 category_summary = (
     filtered
@@ -2518,26 +2522,29 @@ category_summary = (
 )
 
 
-for col in DATA_TYPES_ORDER:
+for kind in DATA_TYPES_ORDER:
 
-    if col not in category_summary.columns:
-        category_summary[col] = 0
+    if kind not in category_summary.columns:
 
-
-category_summary = (
-    category_summary[
-        DATA_TYPES_ORDER
-    ]
-)
+        category_summary[kind] = 0.0
 
 
-category_summary["실제검수수량"] = (
+category_summary = category_summary[
+    DATA_TYPES_ORDER
+].copy()
+
+
+category_summary[
+    "실제검수수량"
+] = (
     category_summary["출고"]
     + category_summary["불량"]
 )
 
 
-category_summary["불량률"] = (
+category_summary[
+    "불량률"
+] = (
     category_summary["불량"]
     .div(
         category_summary[
@@ -2553,9 +2560,9 @@ category_summary["불량률"] = (
 
 category_base = (
     base_filtered
-    .groupby(
-        "카테고리"
-    )["현재고수량"]
+    .groupby("카테고리")[
+        "현재고수량"
+    ]
     .sum()
     .reindex(
         category_summary.index
@@ -2564,12 +2571,14 @@ category_base = (
 )
 
 
-category_summary["기초재고"] = (
-    category_base
-)
+category_summary[
+    "기초재고"
+] = category_base
 
 
-category_summary["이론잔여재고"] = (
+category_summary[
+    "이론잔여재고"
+] = (
     category_summary["기초재고"]
     + category_summary["입고"]
     - category_summary["출고"]
@@ -2577,17 +2586,13 @@ category_summary["이론잔여재고"] = (
 )
 
 
-show_dataframe(
-    category_summary,
-    format_dict={
-        "기초재고": "{:,.0f}",
-        "입고": "{:,.0f}",
-        "출고": "{:,.0f}",
-        "불량": "{:,.0f}",
-        "실제검수수량": "{:,.0f}",
-        "불량률": "{:.2f}%",
-        "이론잔여재고": "{:,.0f}",
-    },
+category_display = (
+    category_summary
+    .reset_index()
+)
+
+show_table(
+    category_display
 )
 
 
@@ -2601,9 +2606,8 @@ st.subheader(
     "🏷️ 불량타입별 월별 수량"
 )
 
-
 defect_only = filtered[
-    filtered["출입구분"] == "불량"
+    filtered["출입구분"].eq("불량")
 ].copy()
 
 
@@ -2630,52 +2634,38 @@ else:
         .sort_index()
     )
 
-    for col in DEFECT_TYPES_ORDER:
+    for defect_type in DEFECT_TYPES_ORDER:
 
-        if col not in type_monthly.columns:
-            type_monthly[col] = 0
+        if (
+            defect_type
+            not in type_monthly.columns
+        ):
 
-    type_monthly = (
-        type_monthly[
-            DEFECT_TYPES_ORDER
+            type_monthly[
+                defect_type
+            ] = 0.0
+
+    type_monthly = type_monthly[
+        DEFECT_TYPES_ORDER
+    ].copy()
+
+    tab_main, tab_minor, tab_table = st.tabs(
+        [
+            "주요 타입 · 테 / 렌즈",
+            "군소 타입 · 전체 / 기타",
+            "수량표",
         ]
     )
 
-    tab_main, tab_minor, tab_table = (
-        st.tabs(
-            [
-                "주요 타입 · 테 / 렌즈",
-                "군소 타입 · 전체 / 기타",
-                "수량 확인표",
-            ]
-        )
-    )
-
-    defect_colors = {
-        "테": "#D32F2F",
-        "렌즈": "#7B1FA2",
-        "전체": "#6D4C41",
-        "기타": "#616161",
-    }
-
-    if dark:
-
-        defect_colors = {
-            "테": "#EF5350",
-            "렌즈": "#CE93D8",
-            "전체": "#BCAAA4",
-            "기타": "#B0BEC5",
-        }
-
-    def make_defect_group_chart(
+    def make_defect_chart(
         data,
-        types,
+        defect_types,
         title,
     ):
 
         fig = go.Figure()
 
-        for defect_type in types:
+        for defect_type in defect_types:
 
             fig.add_trace(
                 go.Bar(
@@ -2684,18 +2674,15 @@ else:
                         defect_type
                     ],
                     name=defect_type,
-                    marker_color=defect_colors[
-                        defect_type
-                    ],
                     text=data[
                         defect_type
                     ].map(
                         lambda x:
-                            (
-                                f"{x:,.0f}"
-                                if x != 0
-                                else ""
-                            )
+                        (
+                            f"{x:,.0f}"
+                            if x != 0
+                            else ""
+                        )
                     ),
                     textposition="outside",
                 )
@@ -2709,11 +2696,12 @@ else:
         fig.update_layout(
             title=title,
             barmode="group",
-            xaxis_title="작업일 기준 년월",
+            xaxis_title="년월",
             yaxis_title="불량 수량",
         )
 
         return fig
+
 
     with tab_main:
 
@@ -2731,7 +2719,7 @@ else:
         if main_types:
 
             st.plotly_chart(
-                make_defect_group_chart(
+                make_defect_chart(
                     type_monthly,
                     main_types,
                     "테 / 렌즈 월별 불량 수량",
@@ -2742,8 +2730,9 @@ else:
         else:
 
             st.info(
-                "테/렌즈 데이터가 없습니다."
+                "테 / 렌즈 데이터가 없습니다."
             )
+
 
     with tab_minor:
 
@@ -2761,7 +2750,7 @@ else:
         if minor_types:
 
             st.plotly_chart(
-                make_defect_group_chart(
+                make_defect_chart(
                     type_monthly,
                     minor_types,
                     "전체 / 기타 월별 불량 수량",
@@ -2772,29 +2761,32 @@ else:
         else:
 
             st.info(
-                "전체/기타 데이터가 없습니다."
+                "전체 / 기타 데이터가 없습니다."
             )
+
 
     with tab_table:
 
-        check_table = (
-            type_monthly.copy()
+        defect_table = (
+            type_monthly
+            .reset_index()
         )
 
-        check_table["불량 합계"] = (
-            check_table.sum(
-                axis=1
-            )
+        defect_table[
+            "불량 합계"
+        ] = (
+            defect_table[
+                DEFECT_TYPES_ORDER
+            ].sum(axis=1)
         )
 
-        show_dataframe(
-            check_table,
-            format_dict="{:,.0f}",
+        show_table(
+            defect_table
         )
 
 
 # ============================================================
-# SKU별 검수 / 불량 / 재고
+# SKU별 현황
 # ============================================================
 
 st.divider()
@@ -2809,48 +2801,42 @@ s1, s2, s3 = st.columns(3)
 
 with s1:
 
-    min_inspection_qty = (
-        st.number_input(
-            "최소 실제 검수수량",
-            min_value=0,
-            value=10,
-            step=10,
-            help=(
-                "실제 검수수량(출고+불량)이 "
-                "너무 작은 SKU를 제외합니다."
-            ),
-        )
+    min_inspection_qty = st.number_input(
+        "최소 실제 검수수량",
+        min_value=0,
+        value=10,
+        step=10,
+        help=(
+            "실제 검수수량(출고+불량)이 "
+            "너무 작은 SKU를 제외합니다."
+        ),
     )
 
 
 with s2:
 
-    min_available_qty = (
-        st.number_input(
-            "최소 기초+입고량",
-            min_value=0,
-            value=0,
-            step=10,
-        )
+    min_available_qty = st.number_input(
+        "최소 기초+입고량",
+        min_value=0,
+        value=0,
+        step=10,
     )
 
 
 with s3:
 
-    top_n = (
-        st.number_input(
-            "표시 SKU 수",
-            min_value=5,
-            max_value=200,
-            value=50,
-            step=5,
-        )
+    top_n = st.number_input(
+        "표시 SKU 수",
+        min_value=5,
+        max_value=200,
+        value=50,
+        step=5,
     )
 
 
-sku_table = build_sku_summary(
-    filtered,
-    base,
+sku_table = make_sku_summary(
+    filtered=filtered,
+    base=base_filtered,
 )
 
 
@@ -2874,46 +2860,31 @@ else:
             sku_table[
                 "기초재고"
             ]
-            +
-            sku_table[
+            + sku_table[
                 "입고수량"
             ]
             >= min_available_qty
         )
     ].copy()
 
-    sku_table = (
-        sku_table
-        .sort_values(
-            [
-                "재고흐름",
-                "불량률",
-                "불량수량",
-                "실제검수수량",
-            ],
-            ascending=[
-                True,
-                False,
-                False,
-                False,
-            ],
-            key=lambda s:
-                s.map(
-                    {
-                        "점검필요(음수)": 0,
-                        "정상": 1,
-                    }
-                )
-                if s.name == "재고흐름"
-                else s,
-        )
-        .head(
-            int(top_n)
-        )
-        .reset_index(
-            drop=True
-        )
+
+    sku_table = sku_table.sort_values(
+        [
+            "불량률",
+            "불량수량",
+            "실제검수수량",
+        ],
+        ascending=[
+            False,
+            False,
+            False,
+        ],
+    ).head(
+        int(top_n)
+    ).reset_index(
+        drop=True
     )
+
 
     if sku_table.empty:
 
@@ -2923,7 +2894,6 @@ else:
 
     else:
 
-        # 화면에서 사용할 순위
         sku_table.insert(
             0,
             "순위",
@@ -2933,35 +2903,28 @@ else:
             ),
         )
 
-        show_dataframe(
-            sku_table[
-                [
-                    "순위",
-                    "상품코드",
-                    "상품명",
-                    "공장",
-                    "카테고리",
-                    "기초재고",
-                    "입고수량",
-                    "출고수량",
-                    "불량수량",
-                    "실제검수수량",
-                    "불량률",
-                    "기말이론재고",
-                    "검수여부",
-                    "재고흐름",
-                ]
-            ],
-            format_dict={
-                "기초재고": "{:,.0f}",
-                "입고수량": "{:,.0f}",
-                "출고수량": "{:,.0f}",
-                "불량수량": "{:,.0f}",
-                "실제검수수량": "{:,.0f}",
-                "불량률": "{:.2f}%",
-                "기말이론재고": "{:,.0f}",
-            },
+        sku_display = sku_table[
+            [
+                "순위",
+                "상품코드",
+                "상품명",
+                "공장",
+                "카테고리",
+                "기초재고",
+                "입고수량",
+                "출고수량",
+                "불량수량",
+                "실제검수수량",
+                "불량률",
+                "기말이론재고",
+            ]
+        ].copy()
+
+        show_table(
+            sku_display,
+            height=600,
         )
+
 
         st.caption(
             "불량률 = 불량수량 ÷ 실제 검수수량 / "
@@ -2970,287 +2933,12 @@ else:
 
 
 # ============================================================
-# 재고 흐름 점검
+# 끝
 # ============================================================
 
 st.divider()
 
-st.subheader(
-    "⚠️ 재고 흐름 점검"
-)
-
-
-flow_check = stock_flow_validation(
-    filtered,
-    base,
-)
-
-
-if flow_check.empty:
-
-    st.info(
-        "검증할 SKU가 없습니다."
-    )
-
-else:
-
-    issue = flow_check[
-        flow_check[
-            "재고흐름"
-        ]
-        == "점검필요(음수)"
-    ].copy()
-
-    f1, f2, f3 = st.columns(3)
-
-    f1.metric(
-        "검증 SKU",
-        f"{len(flow_check):,}",
-    )
-
-    f2.metric(
-        "음수 이론재고 SKU",
-        f"{len(issue):,}",
-    )
-
-    f3.metric(
-        "음수 이론재고 합계",
-        (
-            f"{issue['기말이론재고'].sum():,.0f}"
-            if not issue.empty
-            else "0"
-        ),
-    )
-
-    if issue.empty:
-
-        st.success(
-            "현재 선택 조건에서는 "
-            "기초재고 + 입고 - 출고 - 불량이 "
-            "음수가 되는 SKU가 없습니다."
-        )
-
-    else:
-
-        st.warning(
-            "아래 SKU는 기초재고 + 입고로 확보된 수량보다 "
-            "출고+불량이 많습니다. 원본 거래를 확인해주세요."
-        )
-
-        show_dataframe(
-            issue.head(200)[
-                [
-                    "상품코드",
-                    "상품명",
-                    "공장",
-                    "카테고리",
-                    "기초재고",
-                    "입고수량",
-                    "출고수량",
-                    "불량수량",
-                    "실제검수수량",
-                    "기말이론재고",
-                ]
-            ],
-            format_dict={
-                "기초재고": "{:,.0f}",
-                "입고수량": "{:,.0f}",
-                "출고수량": "{:,.0f}",
-                "불량수량": "{:,.0f}",
-                "실제검수수량": "{:,.0f}",
-                "기말이론재고": "{:,.0f}",
-            },
-        )
-
-
-# ============================================================
-# 출고 기준 실제 검수 분석
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "🔍 출고 기준 실제 검수 분석"
-)
-
-
-out_defect = filtered[
-    filtered["출입구분"].isin(
-        [
-            "출고",
-            "불량",
-        ]
-    )
-].copy()
-
-
-if out_defect.empty:
-
-    st.info(
-        "현재 조건에서는 출고/불량 검수 데이터가 없습니다."
-    )
-
-else:
-
-    inspection_by_sku = (
-        out_defect
-        .groupby(
-            [
-                "상품코드",
-                "상품명",
-                "공장",
-                "카테고리",
-                "출입구분",
-            ]
-        )["수량"]
-        .sum()
-        .unstack(
-            fill_value=0
-        )
-        .reset_index()
-    )
-
-    for col in [
-        "출고",
-        "불량",
-    ]:
-
-        if col not in inspection_by_sku.columns:
-            inspection_by_sku[col] = 0
-
-    inspection_by_sku[
-        "실제검수수량"
-    ] = (
-        inspection_by_sku["출고"]
-        + inspection_by_sku["불량"]
-    )
-
-    inspection_by_sku[
-        "불량률"
-    ] = (
-        inspection_by_sku["불량"]
-        .div(
-            inspection_by_sku[
-                "실제검수수량"
-            ].replace(
-                0,
-                pd.NA,
-            )
-        )
-        * 100
-    ).fillna(0)
-
-    inspection_by_sku = (
-        inspection_by_sku
-        .sort_values(
-            [
-                "불량률",
-                "불량",
-            ],
-            ascending=[
-                False,
-                False,
-            ],
-        )
-    )
-
-    show_dataframe(
-        inspection_by_sku[
-            [
-                "상품코드",
-                "상품명",
-                "공장",
-                "카테고리",
-                "출고",
-                "불량",
-                "실제검수수량",
-                "불량률",
-            ]
-        ],
-        format_dict={
-            "출고": "{:,.0f}",
-            "불량": "{:,.0f}",
-            "실제검수수량": "{:,.0f}",
-            "불량률": "{:.2f}%",
-        },
-        height=450,
-    )
-
-
-# ============================================================
-# 상세 원본
-# ============================================================
-
-st.divider()
-
-st.subheader(
-    "📄 필터링된 원본 데이터"
-)
-
-
-display_cols = [
-    c
-    for c in [
-        "작업일",
-        "출입구분",
-        "공장",
-        "카테고리",
-        "불량타입",
-        "상품코드",
-        "상품명",
-        "수량",
-        "전표제목",
-        "공급처 상품명",
-        "현재고",
-        "작업자",
-        "전표번호",
-    ]
-    if c in filtered.columns
-]
-
-
-display_raw = (
-    filtered[
-        display_cols
-    ]
-    .sort_values(
-        [
-            "작업일",
-            "출입구분",
-            "상품코드",
-        ],
-        ascending=[
-            True,
-            True,
-            True,
-        ],
-    )
-    .copy()
-)
-
-
-show_dataframe(
-    display_raw,
-    height=500,
-)
-
-
-# ============================================================
-# CSV 다운로드
-# ============================================================
-
-csv = (
-    display_raw
-    .to_csv(
-        index=False,
-        encoding="utf-8-sig",
-    )
-)
-
-
-st.download_button(
-    "⬇️ 현재 필터 데이터 CSV 다운로드",
-    data=csv,
-    file_name="입고_출고_불량_필터데이터.csv",
-    mime="text/csv",
+st.caption(
+    "※ 입고/출고/불량 수량은 원본 거래 수량을 직접 집계하며, "
+    "상품마스터 연결은 수량 집계 이후의 기준정보 매핑에만 사용합니다."
 )
