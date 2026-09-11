@@ -64,10 +64,22 @@ st.set_page_config(
 # 기본 설정
 # ============================================================
 
-DEFAULT_DATA_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "data",
-    "raw_data.xlsx",
+APP_DIRECTORY = os.path.dirname(__file__)
+
+# 현재 GitHub 저장소에 있는 raw_data.xlsx 위치를 자동으로 찾습니다.
+# 기존 data/raw_data.xlsx 구조와 저장소 루트 구조를 모두 지원합니다.
+DEFAULT_DATA_PATH_CANDIDATES = [
+    os.path.join(APP_DIRECTORY, "data", "raw_data.xlsx"),
+    os.path.join(APP_DIRECTORY, "raw_data.xlsx"),
+]
+
+DEFAULT_DATA_PATH = next(
+    (
+        path
+        for path in DEFAULT_DATA_PATH_CANDIDATES
+        if os.path.exists(path)
+    ),
+    DEFAULT_DATA_PATH_CANDIDATES[0],
 )
 
 BASE_DATE = pd.Timestamp("2026-01-01")
@@ -1753,6 +1765,31 @@ def show_table(
 
 
 # ============================================================
+# 기본 데이터 파일 저장
+# ============================================================
+
+def save_default_data(file_bytes: bytes) -> Tuple[bool, str]:
+
+    try:
+        directory = os.path.dirname(DEFAULT_DATA_PATH)
+
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        temporary_path = DEFAULT_DATA_PATH + ".uploading"
+
+        with open(temporary_path, "wb") as temporary_file:
+            temporary_file.write(file_bytes)
+
+        os.replace(temporary_path, DEFAULT_DATA_PATH)
+
+    except Exception as exc:
+        return False, f"기본 raw_data.xlsx 저장에 실패했습니다: {exc}"
+
+    return True, "새 raw_data.xlsx가 기본 데이터로 저장되었습니다."
+
+
+# ============================================================
 # 화면
 # ============================================================
 
@@ -1772,35 +1809,59 @@ st.caption(
 
 data_source = (
     DEFAULT_DATA_PATH
-    if os.path.exists(
-        DEFAULT_DATA_PATH
-    )
+    if os.path.exists(DEFAULT_DATA_PATH)
     else None
 )
+
+loaded_data = None
+file_bytes = None
 
 
 uploaded = st.file_uploader(
     "raw_data.xlsx 업로드",
     type=["xlsx"],
     help=(
-        "업로드하면 업로드한 엑셀 파일을 사용합니다."
+        "새 데이터가 생겼을 때만 raw_data.xlsx를 업로드하세요. "
+        "형식을 확인한 뒤 다음 접속부터 사용할 기본 데이터로 저장합니다."
     ),
 )
 
 
 if uploaded is not None:
 
-    file_bytes = (
-        uploaded.getvalue()
-    )
+    uploaded_bytes = uploaded.getvalue()
 
-else:
+    try:
+        uploaded_data = load_data(uploaded_bytes)
+
+    except Exception as exc:
+        st.error(
+            "업로드한 raw_data.xlsx를 저장하지 않았습니다: "
+            f"{exc}"
+        )
+
+    else:
+        saved, message = save_default_data(uploaded_bytes)
+
+        if saved:
+            file_bytes = uploaded_bytes
+            loaded_data = uploaded_data
+            st.success(message)
+
+        else:
+            st.error(
+                f"새 파일을 저장하지 않았습니다. 기존 데이터가 유지됩니다: "
+                f"{message}"
+            )
+
+
+if file_bytes is None:
 
     if data_source is None:
 
         st.info(
-            "data/raw_data.xlsx를 넣거나 "
-            "위에서 엑셀 파일을 업로드해주세요."
+            "기본 raw_data.xlsx 파일을 찾을 수 없습니다. "
+            "저장소 루트 또는 data 폴더에 raw_data.xlsx가 있는지 확인해주세요."
         )
 
         st.stop()
@@ -1824,8 +1885,10 @@ try:
         base,
         master,
         validation,
-    ) = load_data(
-        file_bytes
+    ) = (
+        loaded_data
+        if loaded_data is not None
+        else load_data(file_bytes)
     )
 
 except Exception as e:
