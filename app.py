@@ -40,9 +40,13 @@
 """
 
 
+import base64
+import hashlib
 import io
 import os
 from typing import List, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -71,6 +75,169 @@ DEFAULT_DATA_PATH = os.path.join(
 )
 
 BASE_DATE = pd.Timestamp("2026-01-01")
+
+
+# ============================================================
+# GitHub 영구 데이터 저장
+# ============================================================
+# Streamlit Secrets에 아래 3개 값을 넣으면
+# 새 Excel 업로드 시 GitHub의 기본 데이터 파일을 교체합니다.
+# GITHUB_TOKEN = "github_pat_..."
+# GITHUB_REPO = "소유자/저장소명"
+# GITHUB_FILE_PATH = "data/raw_data.xlsx"
+
+GITHUB_API_BASE = "https://api.github.com"
+
+
+def get_github_settings():
+
+    try:
+        token = st.secrets.get("GITHUB_TOKEN", "")
+        repo = st.secrets.get("GITHUB_REPO", "")
+        file_path = st.secrets.get(
+            "GITHUB_FILE_PATH",
+            "data/raw_data.xlsx",
+        )
+    except Exception:
+        token = ""
+        repo = ""
+        file_path = "data/raw_data.xlsx"
+
+    return (
+        str(token).strip(),
+        str(repo).strip().strip("/"),
+        str(file_path).strip().lstrip("/"),
+    )
+
+
+def save_to_github(file_bytes: bytes) -> Tuple[bool, str]:
+    """검증된 Excel을 GitHub의 기본 데이터 파일로 저장합니다."""
+
+    token, repo, file_path = get_github_settings()
+
+    if not token or not repo:
+        return (
+            False,
+            "GitHub 영구저장 설정이 없습니다. "
+            "Streamlit Secrets에 GITHUB_TOKEN과 GITHUB_REPO를 설정해주세요.",
+        )
+
+    if "/" not in repo:
+        return (
+            False,
+            "GITHUB_REPO 형식이 잘못되었습니다. "
+            "예: 사용자명/저장소명",
+        )
+
+    url = (
+        f"{GITHUB_API_BASE}/repos/{repo}/contents/"
+        f"{file_path}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "streamlit-inventory-dashboard",
+    }
+
+    try:
+        # 기존 파일의 SHA를 가져옵니다.
+        get_request = Request(
+            url,
+            headers=headers,
+            method="GET",
+        )
+
+        try:
+            with urlopen(get_request, timeout=20) as response:
+                import json
+
+                current = json.loads(
+                    response.read().decode("utf-8")
+                )
+                sha = current.get("sha")
+
+        except HTTPError as e:
+            if e.code == 404:
+                sha = None
+            else:
+                detail = e.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+                return (
+                    False,
+                    f"GitHub 기존 파일 확인 실패 ({e.code}): {detail[:300]}",
+                )
+
+        encoded = base64.b64encode(
+            file_bytes
+        ).decode("ascii")
+
+        payload = {
+            "message": "Update raw_data.xlsx from Streamlit dashboard",
+            "content": encoded,
+        }
+
+        if sha:
+            payload["sha"] = sha
+
+        import json
+
+        put_request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                **headers,
+                "Content-Type": "application/json",
+            },
+            method="PUT",
+        )
+
+        with urlopen(put_request, timeout=60) as response:
+            if response.status not in (200, 201):
+                return (
+                    False,
+                    f"GitHub 저장 실패: HTTP {response.status}",
+                )
+
+        return True, "GitHub에 새 데이터가 저장되었습니다."
+
+    except HTTPError as e:
+        detail = e.read().decode(
+            "utf-8",
+            errors="replace",
+        )
+        return (
+            False,
+            f"GitHub 저장 실패 ({e.code}): {detail[:500]}",
+        )
+
+    except URLError as e:
+        return (
+            False,
+            f"GitHub 연결 실패: {e}",
+        )
+
+    except Exception as e:
+        return (
+            False,
+            f"GitHub 저장 중 오류가 발생했습니다: {e}",
+        )
+
+
+def get_local_default_bytes():
+    """현재 GitHub 저장소에 포함된 기본 Excel을 읽습니다."""
+
+    if not os.path.exists(DEFAULT_DATA_PATH):
+        return None
+
+    with open(
+        DEFAULT_DATA_PATH,
+        "rb",
+    ) as f:
+        return f.read()
 
 
 FACTORIES = [
@@ -1770,47 +1937,139 @@ st.caption(
 # 파일
 # ============================================================
 
-data_source = (
-    DEFAULT_DATA_PATH
-    if os.path.exists(
-        DEFAULT_DATA_PATH
+current_default_bytes = get_local_default_bytes()
+
+if current_default_bytes is None:
+
+    st.error(
+        "현재 대시보드의 기본 데이터가 없습니다. "
+        "GitHub의 data/raw_data.xlsx 파일을 확인해주세요."
     )
-    else None
+
+    st.stop()
+
+
+st.caption(
+    "현재 저장된 Excel을 자동으로 불러옵니다. "
+    "새 데이터가 있을 때만 아래에서 Excel을 업로드하세요."
 )
 
-
 uploaded = st.file_uploader(
-    "raw_data.xlsx 업로드",
+    "새 데이터가 있을 때만 Excel 업로드",
     type=["xlsx"],
     help=(
-        "업로드하면 업로드한 엑셀 파일을 사용합니다."
+        "평소에는 업로드하지 않아도 현재 저장된 데이터가 자동으로 표시됩니다. "
+        "새 Excel 데이터가 생겼을 때만 업로드하세요. "
+        "업로드 파일이 정상적으로 읽히는지 먼저 검증한 뒤 "
+        "GitHub의 기본 데이터 파일을 교체합니다."
     ),
 )
 
 
+file_bytes = current_default_bytes
+
+
 if uploaded is not None:
 
-    file_bytes = (
-        uploaded.getvalue()
+    uploaded_bytes = uploaded.getvalue()
+    uploaded_hash = hashlib.sha256(
+        uploaded_bytes
+    ).hexdigest()
+
+    last_hash = st.session_state.get(
+        "last_processed_upload_hash",
+        "",
     )
 
-else:
+    if uploaded_hash == last_hash:
 
-    if data_source is None:
-
-        st.info(
-            "data/raw_data.xlsx를 넣거나 "
-            "위에서 엑셀 파일을 업로드해주세요."
+        saved_session_bytes = st.session_state.get(
+            "uploaded_file_bytes",
+            None,
         )
 
-        st.stop()
+        if saved_session_bytes is not None:
+            file_bytes = saved_session_bytes
 
-    with open(
-        data_source,
-        "rb",
-    ) as f:
+    else:
 
-        file_bytes = f.read()
+        # --------------------------------------------------------
+        # 1. 새 Excel이 실제로 읽히는지 먼저 검증
+        # --------------------------------------------------------
+        validation_error = None
+
+        try:
+            load_data(uploaded_bytes)
+        except Exception as e:
+            validation_error = e
+
+        if validation_error is not None:
+
+            st.error(
+                "새 Excel 파일을 저장하지 않았습니다. "
+                "기존 데이터는 그대로 유지됩니다. "
+                f"오류: {validation_error}"
+            )
+
+        else:
+
+            # ----------------------------------------------------
+            # 2. 검증 성공 후 GitHub에 영구 저장
+            # ----------------------------------------------------
+            token, repo, file_path = get_github_settings()
+
+            if token and repo:
+
+                with st.spinner(
+                    "새 데이터를 저장하는 중입니다..."
+                ):
+                    saved, message = save_to_github(
+                        uploaded_bytes
+                    )
+
+                if saved:
+
+                    st.session_state[
+                        "last_processed_upload_hash"
+                    ] = uploaded_hash
+
+                    st.session_state[
+                        "uploaded_file_bytes"
+                    ] = uploaded_bytes
+
+                    file_bytes = uploaded_bytes
+
+                    st.success(
+                        "새 데이터가 저장되었습니다. "
+                        "다음에 새 창을 열어도 이 데이터가 기본으로 표시됩니다."
+                    )
+
+                else:
+
+                    st.error(
+                        f"{message} 기존 데이터는 그대로 유지됩니다."
+                    )
+
+            else:
+
+                # GitHub 설정이 없으면 기존 데이터 보호를 위해
+                # 업로드 파일을 현재 세션에서만 사용합니다.
+                st.warning(
+                    "GitHub 영구저장 설정이 없어 이번 세션에서만 "
+                    "새 데이터를 사용합니다. "
+                    "새 창에서도 유지하려면 Streamlit Secrets에 "
+                    "GITHUB_TOKEN과 GITHUB_REPO를 설정해주세요."
+                )
+
+                st.session_state[
+                    "last_processed_upload_hash"
+                ] = uploaded_hash
+
+                st.session_state[
+                    "uploaded_file_bytes"
+                ] = uploaded_bytes
+
+                file_bytes = uploaded_bytes
 
 
 # ============================================================
