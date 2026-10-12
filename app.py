@@ -37,15 +37,27 @@
    - 월말이론재고 =
      기초재고 + 누계입고 - 누계출고 - 누계불량
    - '누계 이론재고'라는 표현은 사용하지 않음
+
+9. 데이터 파일 보관 (이번에 추가)
+   - Streamlit Cloud 서버 디스크는 앱이 잠들면 초기화되므로
+     업로드한 raw_data.xlsx는 GitHub 저장소의 'data' 브랜치에 저장
+   - 업로드한 파일 내용이 이미 저장된 파일과 같으면 저장하지 않음
+   - 업로드하지 않으면 저장된 파일을 자동으로 불러옴
 """
 
 
+import base64
+import hashlib
+import hmac
 import io
 import os
-from typing import List, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
+from urllib.parse import quote
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 
@@ -83,6 +95,14 @@ DEFAULT_DATA_PATH = next(
 )
 
 BASE_DATE = pd.Timestamp("2026-01-01")
+
+RAW_DATA_FILENAME = "raw_data.xlsx"
+
+GITHUB_API_URL = "https://api.github.com"
+
+GITHUB_TIMEOUT_SECONDS = 60
+
+KST = timezone(timedelta(hours=9))
 
 
 FACTORIES = [
@@ -1765,10 +1785,26 @@ def show_table(
 
 
 # ============================================================
-# 기본 데이터 파일 저장
+# 로컬 기본 데이터 파일 (저장소에 포함된 raw_data.xlsx)
 # ============================================================
 
+def read_local_default() -> Optional[bytes]:
+
+    if not os.path.exists(DEFAULT_DATA_PATH):
+        return None
+
+    with open(
+        DEFAULT_DATA_PATH,
+        "rb",
+    ) as f:
+
+        return f.read()
+
+
 def save_default_data(file_bytes: bytes) -> Tuple[bool, str]:
+
+    # GitHub 저장 설정(Secrets)이 없을 때만 쓰는 임시 저장입니다.
+    # Streamlit Cloud에서는 앱이 잠들거나 재시작되면 사라집니다.
 
     try:
         directory = os.path.dirname(DEFAULT_DATA_PATH)
@@ -1786,7 +1822,447 @@ def save_default_data(file_bytes: bytes) -> Tuple[bool, str]:
     except Exception as exc:
         return False, f"기본 raw_data.xlsx 저장에 실패했습니다: {exc}"
 
-    return True, "새 raw_data.xlsx가 기본 데이터로 저장되었습니다."
+    return True, (
+        "새 raw_data.xlsx를 임시로 저장했습니다. "
+        "(GitHub 저장 설정이 없어 앱이 재시작되면 사라집니다)"
+    )
+
+
+# ============================================================
+# 데이터 파일 영구 보관 (GitHub data 브랜치)
+# ============================================================
+#
+# Streamlit Cloud 서버의 디스크는 앱이 잠들거나 재시작되면 초기화됩니다.
+# 그래서 업로드한 raw_data.xlsx를 서버 디스크에만 저장하면
+# 다음 접속 때 사라지고, 다시 업로드하라는 상황이 반복됩니다.
+#
+# 이를 막기 위해 GitHub 저장소의 별도 브랜치(data)에 파일을 커밋해
+# 영구 보관합니다. main 브랜치가 아니므로 업로드할 때 앱이
+# 다시 배포되지 않습니다.
+
+
+def git_blob_sha(data: bytes) -> str:
+
+    # GitHub가 파일마다 붙이는 지문(SHA)과 같은 방식으로 계산합니다.
+    # 업로드한 파일과 저장된 파일이 같은지 비교하는 데 사용합니다.
+
+    header = f"blob {len(data)}\0".encode("utf-8")
+
+    return hashlib.sha1(
+        header + data
+    ).hexdigest()
+
+
+def get_github_config() -> Optional[dict]:
+
+    try:
+
+        github_secrets = st.secrets["github"]
+
+        token = str(
+            github_secrets["token"]
+        ).strip()
+
+        repo = str(
+            github_secrets["repo"]
+        ).strip()
+
+        branch = str(
+            github_secrets.get(
+                "branch",
+                "data",
+            )
+        ).strip()
+
+        path = str(
+            github_secrets.get(
+                "path",
+                RAW_DATA_FILENAME,
+            )
+        ).strip()
+
+    except Exception:
+
+        return None
+
+    if not token or not repo:
+        return None
+
+    return {
+        "token": token,
+        "repo": repo,
+        "branch": branch or "data",
+        "path": path or RAW_DATA_FILENAME,
+    }
+
+
+def github_headers(
+    cfg: dict,
+    raw: bool = False,
+) -> dict:
+
+    return {
+        "Authorization": f"Bearer {cfg['token']}",
+        "Accept": (
+            "application/vnd.github.raw+json"
+            if raw
+            else "application/vnd.github+json"
+        ),
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def github_contents_url(
+    repo: str,
+    path: str,
+) -> str:
+
+    return (
+        f"{GITHUB_API_URL}/repos/{repo}"
+        f"/contents/{quote(path)}"
+    )
+
+
+def github_error_text(response) -> str:
+
+    try:
+        detail = response.json().get(
+            "message",
+            "",
+        )
+
+    except Exception:
+        detail = ""
+
+    hint = ""
+
+    if response.status_code == 401:
+        hint = " (토큰이 만료되었거나 잘못되었습니다)"
+
+    elif response.status_code == 403:
+        hint = " (토큰 권한 또는 호출 한도를 확인해주세요)"
+
+    return (
+        f"GitHub 응답 오류 HTTP {response.status_code}: "
+        f"{detail}{hint}"
+    )
+
+
+def format_github_time(value: str) -> str:
+
+    try:
+
+        parsed = datetime.strptime(
+            value,
+            "%Y-%m-%dT%H:%M:%SZ",
+        ).replace(
+            tzinfo=timezone.utc
+        )
+
+        return parsed.astimezone(
+            KST
+        ).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+
+    except Exception:
+
+        return ""
+
+
+@st.cache_data(
+    ttl=600,
+    show_spinner="저장된 데이터를 확인하는 중입니다...",
+)
+def fetch_github_data(
+    repo: str,
+    branch: str,
+    path: str,
+    token: str,
+) -> dict:
+
+    cfg = {
+        "repo": repo,
+        "branch": branch,
+        "path": path,
+        "token": token,
+    }
+
+    response = requests.get(
+        github_contents_url(
+            repo,
+            path,
+        ),
+        headers=github_headers(
+            cfg,
+            raw=True,
+        ),
+        params={
+            "ref": branch,
+        },
+        timeout=GITHUB_TIMEOUT_SECONDS,
+    )
+
+    # 아직 data 브랜치에 저장된 파일이 없는 경우
+    if response.status_code == 404:
+
+        return {
+            "found": False,
+        }
+
+    # 일시적인 오류는 예외로 올려서 캐시되지 않게 합니다.
+    if response.status_code != 200:
+
+        raise RuntimeError(
+            github_error_text(response)
+        )
+
+    file_bytes = response.content
+
+    updated = ""
+
+    try:
+
+        commit_response = requests.get(
+            f"{GITHUB_API_URL}/repos/{repo}/commits",
+            headers=github_headers(cfg),
+            params={
+                "sha": branch,
+                "path": path,
+                "per_page": 1,
+            },
+            timeout=GITHUB_TIMEOUT_SECONDS,
+        )
+
+        if commit_response.status_code == 200:
+
+            commits = commit_response.json()
+
+            if commits:
+
+                updated = format_github_time(
+                    commits[0]["commit"]["committer"]["date"]
+                )
+
+    except Exception:
+
+        updated = ""
+
+    return {
+        "found": True,
+        "bytes": file_bytes,
+        "sha": git_blob_sha(file_bytes),
+        "updated": updated,
+    }
+
+
+def ensure_github_branch(
+    cfg: dict,
+) -> Tuple[bool, str]:
+
+    headers = github_headers(cfg)
+
+    repo_url = (
+        f"{GITHUB_API_URL}/repos/{cfg['repo']}"
+    )
+
+    branch_ref = requests.get(
+        f"{repo_url}/git/ref/heads/"
+        f"{quote(cfg['branch'], safe='/')}",
+        headers=headers,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+    )
+
+    # 이미 data 브랜치가 있으면 그대로 사용
+    if branch_ref.status_code == 200:
+        return True, ""
+
+    # 없으면 기본 브랜치(main)에서 새로 만듭니다.
+    repo_info = requests.get(
+        repo_url,
+        headers=headers,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+    )
+
+    if repo_info.status_code != 200:
+        return False, github_error_text(repo_info)
+
+    default_branch = repo_info.json().get(
+        "default_branch",
+        "main",
+    )
+
+    default_ref = requests.get(
+        f"{repo_url}/git/ref/heads/"
+        f"{quote(default_branch, safe='/')}",
+        headers=headers,
+        timeout=GITHUB_TIMEOUT_SECONDS,
+    )
+
+    if default_ref.status_code != 200:
+        return False, github_error_text(default_ref)
+
+    base_sha = default_ref.json()["object"]["sha"]
+
+    created = requests.post(
+        f"{repo_url}/git/refs",
+        headers=headers,
+        json={
+            "ref": f"refs/heads/{cfg['branch']}",
+            "sha": base_sha,
+        },
+        timeout=GITHUB_TIMEOUT_SECONDS,
+    )
+
+    if created.status_code in (200, 201):
+        return True, ""
+
+    return False, github_error_text(created)
+
+
+def save_to_github(
+    cfg: dict,
+    file_bytes: bytes,
+) -> Tuple[bool, str]:
+
+    try:
+
+        ok, message = ensure_github_branch(cfg)
+
+        if not ok:
+
+            return False, (
+                f"'{cfg['branch']}' 브랜치를 준비하지 못했습니다: "
+                f"{message}"
+            )
+
+        url = github_contents_url(
+            cfg["repo"],
+            cfg["path"],
+        )
+
+        # 저장 직전에 현재 파일의 최신 지문을 다시 확인합니다.
+        # (다른 곳에서 먼저 바뀌었는지, 내용이 같은지 확인)
+        current = requests.get(
+            url,
+            headers=github_headers(cfg),
+            params={
+                "ref": cfg["branch"],
+            },
+            timeout=GITHUB_TIMEOUT_SECONDS,
+        )
+
+        current_sha = None
+
+        if current.status_code == 200:
+
+            current_json = current.json()
+
+            if isinstance(current_json, dict):
+                current_sha = current_json.get("sha")
+
+        elif current.status_code != 404:
+
+            return False, github_error_text(current)
+
+        if current_sha == git_blob_sha(file_bytes):
+
+            fetch_github_data.clear()
+
+            return True, (
+                "저장된 파일과 내용이 같아 "
+                "새로 저장하지 않았습니다."
+            )
+
+        body = {
+            "message": (
+                f"Update {cfg['path']} "
+                f"({datetime.now(KST):%Y-%m-%d %H:%M} KST)"
+            ),
+            "content": base64.b64encode(
+                file_bytes
+            ).decode("ascii"),
+            "branch": cfg["branch"],
+        }
+
+        if current_sha:
+            body["sha"] = current_sha
+
+        response = requests.put(
+            url,
+            headers=github_headers(cfg),
+            json=body,
+            timeout=GITHUB_TIMEOUT_SECONDS,
+        )
+
+    except Exception as exc:
+
+        return False, f"GitHub에 연결하지 못했습니다: {exc}"
+
+    if response.status_code in (200, 201):
+
+        # 모든 방문자가 최신 파일을 바로 보도록 캐시를 비웁니다.
+        fetch_github_data.clear()
+
+        return True, (
+            "새 raw_data.xlsx를 GitHub에 저장했습니다. "
+            "다음 접속부터 이 파일이 자동으로 사용됩니다."
+        )
+
+    return False, github_error_text(response)
+
+
+# ============================================================
+# 관리자 확인 (선택)
+# ============================================================
+#
+# Secrets에 admin_password를 넣으면
+# 비밀번호를 아는 사람만 업로드할 수 있습니다.
+# 넣지 않으면 링크를 아는 누구나 업로드할 수 있습니다.
+
+def admin_unlocked() -> bool:
+
+    try:
+
+        password = str(
+            st.secrets.get(
+                "admin_password",
+                "",
+            )
+        ).strip()
+
+    except Exception:
+
+        password = ""
+
+    if not password:
+        return True
+
+    if st.session_state.get("admin_ok"):
+        return True
+
+    entered = st.text_input(
+        "관리자 비밀번호",
+        type="password",
+        key="admin_password_input",
+    )
+
+    if entered:
+
+        if hmac.compare_digest(
+            entered,
+            password,
+        ):
+
+            st.session_state["admin_ok"] = True
+
+            return True
+
+        st.error(
+            "비밀번호가 올바르지 않습니다."
+        )
+
+    return False
 
 
 # ============================================================
@@ -1802,76 +2278,240 @@ st.caption(
     "검수 기준 불량률은 불량 ÷ (출고 + 불량)으로 계산합니다."
 )
 
+status_box = st.empty()
+
 
 # ============================================================
-# 파일
+# 저장된 데이터 확인
 # ============================================================
 
-data_source = (
-    DEFAULT_DATA_PATH
-    if os.path.exists(DEFAULT_DATA_PATH)
-    else None
+github_cfg = get_github_config()
+
+remote = None
+
+remote_error = ""
+
+if github_cfg is not None:
+
+    try:
+
+        remote = fetch_github_data(
+            github_cfg["repo"],
+            github_cfg["branch"],
+            github_cfg["path"],
+            github_cfg["token"],
+        )
+
+    except Exception as exc:
+
+        remote_error = str(exc)
+
+
+remote_found = bool(
+    remote
+    and remote.get("found")
 )
+
+# 현재 사용 중인 저장 데이터의 지문
+if remote_found:
+
+    current_sha = remote["sha"]
+
+else:
+
+    local_bytes_for_compare = read_local_default()
+
+    current_sha = (
+        git_blob_sha(local_bytes_for_compare)
+        if local_bytes_for_compare is not None
+        else ""
+    )
+
+
+# ============================================================
+# 데이터 업데이트 (바뀌었을 때만)
+# ============================================================
 
 loaded_data = None
 file_bytes = None
+source_label = ""
 
 
-uploaded = st.file_uploader(
-    "raw_data.xlsx 업로드",
-    type=["xlsx"],
-    help=(
-        "새 데이터가 생겼을 때만 raw_data.xlsx를 업로드하세요. "
-        "형식을 확인한 뒤 다음 접속부터 사용할 기본 데이터로 저장합니다."
-    ),
-)
+with st.expander(
+    "🔄 데이터 업데이트 (raw_data.xlsx 내용이 바뀌었을 때만)",
+    expanded=False,
+):
 
+    if admin_unlocked():
 
-if uploaded is not None:
-
-    uploaded_bytes = uploaded.getvalue()
-
-    try:
-        uploaded_data = load_data(uploaded_bytes)
-
-    except Exception as exc:
-        st.error(
-            "업로드한 raw_data.xlsx를 저장하지 않았습니다: "
-            f"{exc}"
+        st.caption(
+            "내용이 바뀐 raw_data.xlsx만 올려주세요. "
+            "저장된 파일과 내용이 같으면 저장하지 않고 "
+            "기존 데이터를 그대로 사용합니다. "
+            "업로드하지 않으면 저장된 데이터를 자동으로 불러옵니다."
         )
 
-    else:
-        saved, message = save_default_data(uploaded_bytes)
+        if github_cfg is None:
 
-        if saved:
-            file_bytes = uploaded_bytes
-            loaded_data = uploaded_data
-            st.success(message)
-
-        else:
-            st.error(
-                f"새 파일을 저장하지 않았습니다. 기존 데이터가 유지됩니다: "
-                f"{message}"
+            st.warning(
+                "GitHub 저장 설정(Secrets)이 없어서, "
+                "업로드한 파일은 앱이 재시작되면 사라집니다."
             )
+
+        uploaded = st.file_uploader(
+            "raw_data.xlsx 업로드",
+            type=["xlsx"],
+        )
+
+        if uploaded is not None:
+
+            candidate_bytes = uploaded.getvalue()
+
+            candidate_sha = git_blob_sha(
+                candidate_bytes
+            )
+
+            try:
+
+                candidate_data = load_data(
+                    candidate_bytes
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    "업로드한 raw_data.xlsx를 저장하지 않았습니다. "
+                    "기존 데이터가 유지됩니다: "
+                    f"{exc}"
+                )
+
+            else:
+
+                if (
+                    st.session_state.get("saved_sha")
+                    == candidate_sha
+                ):
+
+                    file_bytes = candidate_bytes
+
+                    loaded_data = candidate_data
+
+                    source_label = (
+                        "방금 업로드한 파일 (저장 완료)"
+                    )
+
+                    st.success(
+                        "이 파일이 저장되어 사용 중입니다."
+                    )
+
+                elif candidate_sha == current_sha:
+
+                    st.info(
+                        "현재 저장된 데이터와 내용이 같습니다. "
+                        "업로드할 필요가 없습니다. "
+                        "(기존 데이터를 사용 중)"
+                    )
+
+                else:
+
+                    if github_cfg is not None:
+
+                        with st.spinner(
+                            "GitHub에 저장하는 중입니다..."
+                        ):
+
+                            saved, message = save_to_github(
+                                github_cfg,
+                                candidate_bytes,
+                            )
+
+                    else:
+
+                        saved, message = save_default_data(
+                            candidate_bytes
+                        )
+
+                    if saved:
+
+                        st.session_state[
+                            "saved_sha"
+                        ] = candidate_sha
+
+                        file_bytes = candidate_bytes
+
+                        loaded_data = candidate_data
+
+                        source_label = (
+                            "방금 업로드한 파일 (저장 완료)"
+                        )
+
+                        st.success(message)
+
+                    else:
+
+                        st.error(
+                            "새 파일을 저장하지 않았습니다. "
+                            "기존 데이터가 유지됩니다: "
+                            f"{message}"
+                        )
+
+
+# ============================================================
+# 업로드가 없으면 저장된 데이터를 자동으로 불러옴
+# ============================================================
+
+if remote_error:
+
+    st.warning(
+        "GitHub에 저장된 데이터를 불러오지 못했습니다. "
+        "저장소에 포함된 기본 파일을 대신 사용합니다. "
+        f"({remote_error})"
+    )
 
 
 if file_bytes is None:
 
-    if data_source is None:
+    if remote_found:
 
-        st.info(
-            "기본 raw_data.xlsx 파일을 찾을 수 없습니다. "
-            "저장소 루트 또는 data 폴더에 raw_data.xlsx가 있는지 확인해주세요."
+        file_bytes = remote["bytes"]
+
+        updated_text = (
+            remote.get("updated")
+            or "확인 불가"
         )
 
-        st.stop()
+        source_label = (
+            "GitHub 저장 데이터 "
+            f"(최종 업데이트 {updated_text})"
+        )
 
-    with open(
-        data_source,
-        "rb",
-    ) as f:
+    else:
 
-        file_bytes = f.read()
+        local_bytes = read_local_default()
+
+        if local_bytes is None:
+
+            st.info(
+                "저장된 raw_data.xlsx가 없습니다. "
+                "위의 '데이터 업데이트'에서 파일을 업로드해주세요."
+            )
+
+            st.stop()
+
+        file_bytes = local_bytes
+
+        source_label = "저장소 기본 파일 (raw_data.xlsx)"
+
+        if github_cfg is not None and not remote_error:
+
+            source_label += (
+                " — 아직 업로드해서 저장한 파일이 없습니다"
+            )
+
+
+status_box.caption(
+    f"📁 현재 사용 중인 데이터: {source_label}"
+)
 
 
 # ============================================================
